@@ -340,19 +340,55 @@ dependência nova e reescrita de validação em todas as rotas. **Não é urgent
 para injeção de SQL** (as consultas são parametrizadas; 33 payloads reais não
 passaram), e sim para robustez e clareza. Fica como melhoria, não como correção.
 
-### [ ] 6. Rodar a senha do banco — não estava na lista e é o mais urgente
+### [x] 6. Rodar a senha do banco — FEITO em 12/08/2026
 
-A `DATABASE_URL` do banco novo foi colada em conversa e deve ser considerada
-exposta. Enquanto ela valer, todo o resto deste checklist é secundário: quem tem
-a string entra pelo console SQL e nenhuma defesa da aplicação alcança isso.
+A senha do `neondb_owner` foi colada em conversa e valia para o cluster inteiro:
+com ela, trocar o nome do banco na string bastava para abrir produção pelo
+console SQL, e nenhuma defesa da aplicação alcança isso.
 
-Console da Neon → projeto → **Roles** → `neondb_owner` → **Reset password**, e
-atualize a variável na Render.
+Trocada pela API da Neon. Medido depois, e não suposto:
 
-### [ ] 7. Apagar o projeto Neon antigo depois do corte
+```
+velha -> producao              RECUSOU   password authentication failed
+velha -> dev                   RECUSOU   password authentication failed
+nova  -> producao              CONECTOU  neondb_owner @ neondb (barbeiros=4)
+cutflow_app -> producao        CONECTOU  cutflow_app @ neondb (barbeiros=4)
+```
 
-O banco de São Paulo continua de pé, com uma cópia da conta admin. Enquanto os
-dois existirem, é fácil apontar para o errado sem perceber.
+**A troca não derrubou o site**, e isso foi verificado antes de rodar: um
+`pg_stat_activity` em produção mostrou que quem atende requisição é o
+`cutflow_app`, não o dono. O dono só aparece no build, no `npm run release`.
+
+Sobra disso: a variável **`DATABASE_URL_MIGRACAO` da Render está com a senha
+velha**. Enquanto não for atualizada, o site segue no ar normalmente e é o
+próximo *build* que falha, em `npm run release`. A string nova está em
+`.neondb_owner.local` (ignorado pelo git).
+
+### [x] 7. Apagar o projeto Neon antigo — FEITO em 12/08/2026
+
+O projeto de São Paulo tinha uma cópia da conta admin e convidava a apontar para
+o banco errado — já tinha acontecido uma vez neste projeto. Confirmado pela API
+que sumiu: sobrou `cutflow-prod` (Ohio) e um `neon-citron-fence` sem relação,
+criado pela integração da Vercel.
+
+Junto com ele morreram `VITE_NEON_AUTH_URL` e `NEON_AUTH_URL`, que apontavam
+para o endpoint de Neon Auth de lá. Nenhum arquivo do projeto lê essas duas
+variáveis, então nada quebrou — mas a de prefixo `VITE_` era uma armadilha
+armada: bastaria alguém escrever `import.meta.env.VITE_NEON_AUTH_URL` para ela
+passar a ser servida ao navegador. Removidas do `.env.local`.
+
+### Como o `.env.local` está agora
+
+Duas credenciais, a mesma separação do `render.yaml`:
+
+| Variável | Papel | Para quê |
+| --- | --- | --- |
+| `DATABASE_URL` | `cutflow_dev_app` | o que a aplicação usa; lê e escreve, não faz DDL |
+| `DATABASE_URL_MIGRACAO` | `neondb_owner` | só o `npm run db:migrate`, que roda DDL |
+
+As duas apontam para o banco **`cutflow_dev`**, nunca para `neondb`. O dev usar
+o mesmo papel restrito da produção é de propósito: erro de permissão aparece na
+máquina antes de aparecer no ar.
 
 ## Deploy
 
