@@ -26,6 +26,49 @@ import { neon } from "@neondatabase/serverless";
 const BASE = `http://localhost:${process.env.PORT || 3001}/api`;
 const sql = neon(process.env.DATABASE_URL);
 
+// ── Trava: a API e este script precisam falar com o MESMO banco ──────────────
+//
+// Este teste cria contas pela API e limpa pelo `sql` daqui. Se os dois
+// apontarem para bancos diferentes, ele cria num e limpa no outro — e diz
+// "contas de teste removidas" tendo apagado nada.
+//
+// Isso aconteceu de verdade em 12/08/2026: um `node server/index.js` esquecido
+// de outra sessão, iniciado SEM `--env-file-if-exists=.env.local`, seguia
+// ocupando a porta 3001 com credenciais de produção. O servidor novo nem subia
+// (porta ocupada), o teste falava com o antigo, e "Barbearia A" e "Barbearia B"
+// foram parar no banco das barbearias reais — visíveis na listagem pública do
+// site no ar.
+//
+// A trava é escrever uma marca aqui e exigir que a API a enxergue.
+const marca = `iso-sonda-${process.pid}-${Date.now()}`;
+await sql`insert into limites_uso (chave, contagem, expira_em)
+          values (${marca}, 1, now() + interval '5 minutes')`;
+const [visto] = await sql`select 1 from limites_uso where chave = ${marca}`;
+await sql`delete from limites_uso where chave = ${marca}`;
+
+const saude = await fetch(BASE + "/health").catch(() => null);
+if (!saude?.ok) {
+  console.error(`\nA API não respondeu em ${BASE}. Suba com \`npm run dev\` noutro terminal.\n`);
+  process.exit(1);
+}
+const publicas = await (await fetch(BASE + "/publico/barbearias")).json();
+const reais = publicas.filter((b) => !/^Barbearia [AB]$/.test(b.nome));
+if (reais.length) {
+  console.error(
+    `\nPARE. A API em ${BASE} enxerga ${reais.length} barbearia(s) que não são deste teste:\n` +
+    reais.map((b) => `  - ${b.nome}`).join("\n") +
+    `\n\nEste teste CRIA E APAGA contas. Num banco com dado real, isso é destrutivo.\n` +
+    `Provável causa: um servidor de outra sessão ocupando a porta ${process.env.PORT || 3001}\n` +
+    `com outras credenciais. Confira com:\n` +
+    `  Get-NetTCPConnection -LocalPort ${process.env.PORT || 3001} -State Listen\n`
+  );
+  process.exit(1);
+}
+if (!visto) {
+  console.error("\nNão consegui escrever a marca de sondagem no banco. Abortando.\n");
+  process.exit(1);
+}
+
 let falhas = 0;
 const ok = (cond, texto, extra) => {
   console.log(`${cond ? "  ok  " : " VAZOU"} ${texto}${!cond && extra !== undefined ? ` → ${JSON.stringify(extra).slice(0, 160)}` : ""}`);

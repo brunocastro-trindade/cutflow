@@ -377,6 +377,36 @@ variáveis, então nada quebrou — mas a de prefixo `VITE_` era uma armadilha
 armada: bastaria alguém escrever `import.meta.env.VITE_NEON_AUTH_URL` para ela
 passar a ser servida ao navegador. Removidas do `.env.local`.
 
+### Incidente de 12/08/2026 — servidor esquecido apontado para produção
+
+Um `node server/index.js` iniciado em **11/08 às 14:38**, de outra sessão e
+**sem** `--env-file-if-exists=.env.local`, continuou ocupando a porta 3001 com
+credenciais de produção herdadas do shell. Consequências, todas reais:
+
+- Um servidor novo iniciado na mesma porta **não subia** (porta ocupada) e não
+  reclamava em lugar visível. Tudo que se chamava de "localhost" era o antigo.
+- O `npm run isolamento` cria contas **pela API** e limpa pelo `DATABASE_URL`
+  **dele**. Com os dois em bancos diferentes, criou em produção e limpou no dev:
+  imprimiu "contas de teste removidas" tendo apagado nada.
+- "Barbearia A" e "Barbearia B" ficaram listadas na rota pública
+  `/api/publico/barbearias` do site no ar, junto das barbearias reais.
+- O front local do desenvolvedor vinha falando com produção havia um dia.
+
+Removidas em transação, com cópia antes e conferência de que as contas reais
+ficaram idênticas. Junto saiu a conta `priv-teste@local`, que também era lixo de
+teste — e cujo `senha_hash` tinha **1 caractere**, não um hash bcrypt.
+
+Duas travas nasceram daqui:
+
+- **`server/index.js`** passa a registrar no start o `host`, a `base` e o
+  `papel` do banco — nunca a senha. Servidor apontado para o lugar errado agora
+  se denuncia na primeira linha do log.
+- **`scripts/isolamento.js`** recusa rodar se a API enxergar qualquer barbearia
+  que não seja do próprio teste, e explica onde procurar o processo intruso.
+
+A lição não é "matar o processo": é que **um servidor no banco errado era
+indistinguível de um certo**, porque nada dizia para onde ele apontava.
+
 ### Como o `.env.local` está agora
 
 Duas credenciais, a mesma separação do `render.yaml`:
