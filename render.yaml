@@ -1,63 +1,58 @@
 # Blueprint da Render — https://render.com/docs/blueprint-spec
 #
-# Com este arquivo no repositório, a Render configura o serviço sozinha:
-# no painel, "New +" → "Blueprint" → aponte para este repositório. Só dois
-# segredos precisam ser digitados à mão (ver `sync: false` abaixo).
+# DOIS ambientes, do mesmo repositório, em branches diferentes:
+#
+#   cutflow      ← branch `producao`  → banco Neon `main` (dados reais)
+#   cutflow-dev  ← branch `main`      → branch Neon `dev` (descartável)
+#
+# O portão entre eles é um PR de `main` para `producao`. Nada chega às
+# barbearias sem passar por lá.
 #
 # A aplicação é UM processo Node que serve a API e o front compilado. Não há
 # estado em memória entre requisições — rate limit e bloqueio de login vivem na
 # tabela `limites_uso` —, então mais de uma instância funciona sem ajuste.
+#
+# Cada serviço pede duas connection strings no painel (`sync: false`, ou seja,
+# nunca guardadas aqui). E são bancos DIFERENTES em cada serviço: apontar o dev
+# para o banco de produção derruba justamente o isolamento que este arquivo
+# existe para criar.
 
 services:
+  # ── PRODUÇÃO ────────────────────────────────────────────────────────────────
   - type: web
     name: cutflow
     runtime: node
     plan: free
+    branch: producao
 
     # Ohio é a região mais próxima do banco.
     #
-    # O Neon deste projeto está em `sa-east-1` (São Paulo) e a Render não tem
-    # região na América do Sul. Ohio é a de menor latência entre as opções;
-    # ainda assim, cada consulta paga a ida e volta até São Paulo (~120 ms).
-    # Ver a nota sobre latência no fim deste arquivo.
+    # O Neon está em `us-east-2` (Ohio) desde a migração. Manter os dois no
+    # mesmo lado evita os ~120 ms por consulta que havia com o banco em São
+    # Paulo — e as rotas com rate limit fazem uma consulta a mais por requisição.
     region: ohio
 
-    # `npm ci`, e não `npm install`: respeita o package-lock que foi testado.
-    # As dependências estão com `^` e um install solto pode resolver para um
-    # minor diferente do que passou no smoke.
-    #
     # `--include=dev` é obrigatório aqui, e o motivo não é óbvio.
     #
     # O `NODE_ENV=production` declarado mais abaixo vale também para o BUILD, e
     # com ele o `npm ci` pula as devDependencies. O `vite` é devDependency — e
     # deve ser, é ferramenta de build, não código que roda em produção. Sem o
-    # flag, o build instala só as 10 dependências de produção e morre em
+    # flag, o build instala só as dependências de produção e morre em
     # "sh: 1: vite: not found".
     #
-    # ── A migração usa outra credencial, de propósito ────────────────────────
-    #
-    # `npm run release` aplica db/schema.sql, que tem 46 instruções de DDL. O
-    # papel que a aplicação usa em runtime (`cutflow_app`) NÃO consegue rodá-las
-    # — testado: "permission denied for schema public". É esse o objetivo.
-    #
-    # `npm run release` escolhe a credencial sozinho: usa
-    # DATABASE_URL_MIGRACAO (papel dono) quando existe, e cai para DATABASE_URL
-    # quando não. A escolha mora em scripts/migrate.js, e não numa linha de
-    # shell aqui — porque aqui ela falhava calada: com a variável ausente,
-    # `DATABASE_URL="$DATABASE_URL_MIGRACAO"` virava string vazia e o erro
-    # apontava para a variável errada.
-    #
-    # O processo que atende requisição sobe com a DATABASE_URL restrita, e uma
-    # credencial vazada dali não cria tabela, não apaga nada e não cria papel.
+    # `npm run release` escolhe a credencial sozinho: usa DATABASE_URL_MIGRACAO
+    # (papel dono) quando existe, e cai para DATABASE_URL quando não. A escolha
+    # mora em scripts/migrate.js, e não numa linha de shell aqui — porque aqui
+    # ela falhava calada: com a variável ausente, `DATABASE_URL="$OUTRA"` virava
+    # string vazia e o erro apontava para a variável errada.
     #
     # O release está no build porque `preDeployCommand` só existe nos planos
-    # pagos. A migração é idempotente e só adiciona. Ao migrar para um plano
-    # pago, mova a última parte para `preDeployCommand`.
+    # pagos. A migração é idempotente e só adiciona.
     buildCommand: npm ci --include=dev && npm run build && npm run release
     startCommand: npm start
 
-    # O servidor responde {"ok":true} nesta rota sem tocar no banco: serve para
-    # a Render saber que a instância subiu, e não vira consulta a cada checagem.
+    # Responde {"ok":true} sem tocar no banco: serve para a Render saber que a
+    # instância subiu, e não vira consulta a cada checagem.
     healthCheckPath: /api/health
 
     envVars:
@@ -78,44 +73,57 @@ services:
       - key: JWT_SECRET
         generateValue: true
 
-      # `sync: false` = a Render pede este valor no painel e NÃO o guarda no
-      # repositório.
-      #
-      # DUAS credenciais, com papéis diferentes:
-      #
-      #   DATABASE_URL           papel `cutflow_app` — só lê e escreve nas
-      #                          tabelas. É a que o processo carrega enquanto
-      #                          atende requisição. Gerada por
-      #                          `npm run db:papel-app`.
-      #
-      #   DATABASE_URL_MIGRACAO  papel dono (`neondb_owner`) — faz DDL. Usada
-      #                          SÓ na linha do release, dentro do build.
-      #
-      # A separação existe para o estrago de um vazamento ser menor: a string
-      # que fica no processo em produção não cria tabela, não apaga dados e não
-      # cria papel. Testado nos dois sentidos.
-      #
-      # Use a opção "Pooled connection" do Neon e mantenha o sslmode=require.
+      # Papel `cutflow_app`: só lê e escreve nas tabelas. É a credencial que o
+      # processo carrega enquanto atende requisição. Gerada por
+      # `npm run db:papel-app`.
+      - key: DATABASE_URL
+        sync: false
+
+      # Papel dono: faz DDL. Usada só pelo release, dentro do build.
+      - key: DATABASE_URL_MIGRACAO
+        sync: false
+
+  # ── DESENVOLVIMENTO ─────────────────────────────────────────────────────────
+  # Mesmo código, banco descartável. É aqui que feature nova chega primeiro.
+  - type: web
+    name: cutflow-dev
+    runtime: node
+    plan: free
+    branch: main
+    region: ohio
+
+    buildCommand: npm ci --include=dev && npm run build && npm run release
+    startCommand: npm start
+    healthCheckPath: /api/health
+
+    envVars:
+      # `production` também aqui, de propósito: é o modo que vai para as
+      # barbearias, e bug que só aparece nele precisa aparecer no dev antes.
+      - key: NODE_ENV
+        value: production
+
+      - key: TRUST_PROXY
+        value: "1"
+
+      # Segredo próprio: sessão de dev não vale em produção, e vice-versa.
+      - key: JWT_SECRET
+        generateValue: true
+
+      # ATENÇÃO: estas DUAS apontam para a branch `dev` do Neon, nunca para o
+      # banco de produção. É o que separa dado de teste de dado de barbearia.
       - key: DATABASE_URL
         sync: false
 
       - key: DATABASE_URL_MIGRACAO
         sync: false
 
-# ── Duas coisas para decidir antes de abrir aos testadores ────────────────────
+# ── Duas coisas para decidir ──────────────────────────────────────────────────
 #
 # 1. PLANO FREE HIBERNA.
-#    No free, a instância dorme após ~15 min sem tráfego e o próximo acesso
-#    espera ~50 s pelo start. Para um teste em que barbearias reais vão abrir o
-#    link, isso parece "o site caiu". O plano Starter mantém de pé e libera o
-#    `preDeployCommand`.
+#    A instância dorme após ~15 min sem tráfego e o próximo acesso espera ~50 s.
+#    Em dev, tanto faz. Em produção, com barbearia real abrindo o link, parece
+#    site fora do ar — e agora há barbearias de verdade usando. O plano Starter
+#    mantém de pé e libera o `preDeployCommand`.
 #
-# 2. LATÊNCIA ATÉ O BANCO.
-#    Aplicação em Ohio, banco em São Paulo: ~120 ms por ida e volta. As rotas
-#    com rate limit (/api/auth e /api/publico) fazem UMA consulta a mais por
-#    requisição, para o contador compartilhado — logo, ~240 ms só de rede antes
-#    de a rota começar o trabalho dela.
-#
-#    Se isso incomodar, a saída é aproximar os dois: criar o banco Neon em
-#    `us-east-2` (Ohio) e migrar os dados, em vez de mexer no rate limit — o
-#    contador precisa ser compartilhado entre instâncias.
+# 2. DOIS SERVIÇOS FREE = DUAS HIBERNAÇÕES.
+#    Se for pagar por um só, pague o de produção.
