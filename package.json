@@ -13,6 +13,7 @@
     "db:papel-app": "node --env-file-if-exists=.env.local scripts/papel-app.js",
     "convite": "node --env-file-if-exists=.env.local scripts/convite.js",
     "smoke": "node --env-file-if-exists=.env.local scripts/smoke.js",
+    "ensaiar-migracao": "node --env-file-if-exists=.env.local scripts/ensaiar-migracao.js",
     "isolamento": "node --env-file-if-exists=.env.local scripts/isolamento.js",
     "build": "vite build",
     "start": "node --env-file-if-exists=.env.local server/index.js",
