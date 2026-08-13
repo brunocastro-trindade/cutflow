@@ -492,13 +492,131 @@ O preço é uma ida ao banco por requisição limitada. Só as rotas sensíveis
 ```bash
 npm run lint      # eslint em src, server e scripts
 npm run build     # falha em import quebrado
+npm run guardas   # quatro invariantes de segurança; NÃO precisa de banco
 npm run db:migrate  # idempotente; aplica db/schema.sql
 npm run smoke     # contrato real contra a API (precisa da API no ar)
+npm run isolamento  # uma conta não alcança dados de outra (precisa da API no ar)
 ```
 
 O `smoke` (`scripts/smoke.js`) é o que importa: dispara contra a API os mesmos
 corpos que as telas mandam e confere os campos que elas leem. É o único ponto do
 projeto que impede front e servidor de voltarem a discordar sobre nomes de campo.
+
+### CI — o que a máquina verifica sozinha (desde 13/08/2026)
+
+`.github/workflows/ci.yml` roda em todo PR e em todo push para `main` e
+`producao`: `lint`, `build` e `guardas`, nos **dois extremos** da faixa
+`engines.node` (22 e 24) — testar as pontas é o que impede a faixa declarada de
+virar ficção.
+
+As actions estão **fixadas por SHA**, não por tag. Tag em Git é móvel: `@v7`
+pode apontar para outro commit amanhã. O comentário ao lado registra qual versão
+o hash representa.
+
+#### `npm run guardas` — invariante conferido por máquina, não por auditoria
+
+`scripts/guardas.js` transforma em teste cinco coisas que este documento já
+afirmava e que só eram verdade no dia da medição:
+
+| Guarda | De onde veio |
+| --- | --- |
+| `src/` não lê `import.meta.env` / `VITE_` | item 1 do checklist — a armadilha `VITE_NEON_AUTH_URL` |
+| `src/` não tem credencial literal | o botão "Acessar Painel Demo", removido em 07/08 |
+| `dist/` sem `postgresql://`, `neon.tech`, `DATABASE_URL`, `JWT_SECRET` | item 1 do checklist |
+| `engines.node` tem teto | a Render escolhendo Node 26.7.0 |
+| nenhum segredo real em arquivo **versionado** | os dois quase-acidentes de 13/08 (abaixo) |
+
+A quinta guarda nasceu no mesmo dia em que foi escrita, e o motivo importa. As
+outras quatro olham o que vai para o **navegador**; esta olha o que vai para o
+**repositório**, que é caminho diferente e foi percorrido duas vezes numa tarde:
+o endpoint real do Neon foi escrito num documento versionado, e uma API key de
+produção quase foi colada no `.env.example`.
+
+O `.env.example` é a armadilha fina: ele **é versionado**, e o nome promete que é
+só exemplo — é o último lugar onde alguém procuraria um segredo. O `.env.local`
+e os `.<papel>.local` estão ignorados e devem mesmo conter credencial; a guarda
+varre só o que o `git ls-files` lista, então não confunde os dois.
+
+A segunda guarda procura pela **forma** (`senha: "algo"`), não pelo nome do
+mecanismo — que foi exatamente o erro que deixou o botão de demo passar por duas
+varreduras. Campo de formulário (`senha: ""`) não casa, de propósito.
+
+**As quatro foram validadas quebrando cada uma de propósito**, e cada uma
+acusou, com saída 1. Teste que não sabe falhar não vale nada.
+
+### CI com banco — `smoke` e `isolamento` em branch efêmera
+
+`.github/workflows/ci-banco.yml` roda os dois testes que provam **comportamento**,
+contra uma branch do Neon criada e destruída no próprio job. Isto fecha o item 4
+deste checklist ("testar em branch efêmera, não em produção").
+
+Por que uma branch, e não um Postgres do runner: `server/db.js` usa `neon(url)`,
+o driver HTTP, que fala com o endpoint da Neon e não com um Postgres qualquer.
+Um `services: postgres:16` do Actions **não serve** — a alternativa seria subir o
+proxy HTTP da Neon e configurar `neonConfig`, o que obrigaria a mexer em
+`server/db.js`.
+
+**A branch nasce `schema-only`** — estrutura sem dados. Não é detalhe: o
+`isolamento.js` se recusa a rodar se a API enxergar qualquer barbearia que não
+seja do próprio teste (trava nascida do incidente de 12/08), então uma branch com
+dados copiados faria o CI abortar sempre, e com razão. E os dois testes criam e
+apagam contas — rodar isso sobre cópia de dado real é destrutivo por desenho.
+
+É o oposto do `ensaiar-migracao`, que quer os dados justamente para ver a
+migração sobreviver ao que já está gravado. Perguntas diferentes, scripts
+diferentes.
+
+Três decisões do workflow que não são óbvias:
+
+- **O CI usa o papel restrito**, não o dono: `db:papel-app` cria o
+  `cutflow_dev_app` na branch efêmera com senha gerada na hora. Erro de permissão
+  aparece no PR, não no ar. Alterar o papel ali não afeta nada — cada branch do
+  Neon é um Postgres independente.
+- **`NODE_ENV` fica fora de `production`**, ao contrário do `render.yaml`. Em
+  produção o cookie ganha a marca `secure` e só volta por HTTPS; contra
+  `http://localhost` a sessão não voltaria e o smoke falharia por configuração,
+  não por bug. Quem valida o modo produção de verdade é o serviço `cutflow-dev`.
+- **A branch é apagada em `always()`**, e `scripts/ci-banco.js` recusa apagar o
+  que não nasceu ali: só nomes começando em `ci-`, nunca a branch padrão.
+
+**Segredos necessários** (Settings → Secrets and variables → Actions):
+`NEON_API_KEY` e `NEON_PROJECT_ID`. Sem eles o workflow se declara PULADO em vez
+de falhar. **Enquanto não forem configurados, rode `smoke` e `isolamento` na sua
+máquina antes de abrir PR para `producao`.**
+
+### O "banco de dev" é um BANCO, não uma branch do Neon
+
+Corrigido em 13/08/2026. O `render.yaml` diz "branch Neon `dev`", e não é isso
+que está montado: as duas connection strings apontam para o **mesmo endpoint**
+— o mesmo host `ep-...-pooler`, mudando só o nome do banco no fim: `neondb`
+para produção, `cutflow_dev` para desenvolvimento. (Confira você mesmo no
+`.env.local`; o endpoint real não é escrito aqui de propósito, porque este
+arquivo é versionado.)
+
+O que isso muda na prática:
+
+- **A separação de dados é real** — bancos distintos no mesmo cluster não se
+  enxergam, e os papéis são diferentes. O isolamento que interessa está de pé.
+- **A separação de compute não existe.** Os dois dividem o mesmo endpoint: carga
+  ou trava no dev afeta produção. Uma branch de verdade teria compute próprio.
+- **Trocar o nome do banco na string é suficiente para escrever em produção** —
+  que é exatamente como o incidente de 12/08 aconteceu.
+
+Não foi alterado agora porque mover o dev para uma branch própria muda as duas
+connection strings da Render e do `.env.local`, e é decisão do dono.
+
+#### O portão para `producao` ainda não é obrigatório
+
+**Branch protection não está disponível** neste repositório: privado em plano
+free, e a API responde `Upgrade to GitHub Pro`. Ou seja, o PR de `main` para
+`producao` que o `render.yaml` descreve é convenção, e um push direto sobe para
+as barbearias sem CI.
+
+A saída de custo zero é `autoDeploy: false` no serviço `cutflow` e o deploy
+disparado pelo CI só depois do verde — a trava deixa de ser "não dá para
+mergear" e vira "não dá para deployar", que é o que protege a barbearia. As
+alternativas pagas são GitHub Pro ou tornar o repositório público (e este
+documento descreve a superfície de ataque do sistema).
 
 ---
 

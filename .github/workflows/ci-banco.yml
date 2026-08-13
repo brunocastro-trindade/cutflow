@@ -1,0 +1,161 @@
+# CI com banco — `smoke` e `isolamento` contra uma branch efêmera do Neon.
+#
+# Este é o par do ci.yml. Lá ficam as verificações que não precisam de
+# credencial (lint, build, guardas); aqui, as duas que provam COMPORTAMENTO:
+#
+#   smoke       dispara contra a API os mesmos corpos que as telas mandam e
+#               confere os campos que elas leem. É o único ponto do projeto que
+#               impede front e servidor de discordarem sobre nome de campo.
+#   isolamento  prova, rota a rota, que uma conta não alcança dados de outra.
+#
+# A branch é criada schema-only (estrutura sem dados), usada, e apagada no fim
+# — inclusive quando algo falha no meio. Ver scripts/ci-banco.js para o porquê
+# de cada escolha.
+#
+# ── Segredos necessários ─────────────────────────────────────────────────────
+#
+#   NEON_API_KEY      Console da Neon → Account settings → API keys
+#   NEON_PROJECT_ID   id do projeto (cutflow-prod)
+#
+# Em: Settings → Secrets and variables → Actions → New repository secret.
+#
+# Sem eles, este workflow se declara PULADO em vez de falhar — para um fork ou
+# um clone sem segredo não ficar vermelho sem motivo.
+
+name: CI (banco)
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-banco-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # O contexto `secrets` não pode ser lido direto num `if` de job. O caminho
+  # suportado é este: um job curto que olha os segredos e publica um output.
+  segredos:
+    runs-on: ubuntu-latest
+    outputs:
+      presentes: ${{ steps.ver.outputs.presentes }}
+    steps:
+      - id: ver
+        env:
+          CHAVE: ${{ secrets.NEON_API_KEY }}
+          PROJETO: ${{ secrets.NEON_PROJECT_ID }}
+        run: |
+          if [ -n "$CHAVE" ] && [ -n "$PROJETO" ]; then
+            echo "presentes=sim" >> "$GITHUB_OUTPUT"
+          else
+            echo "presentes=nao" >> "$GITHUB_OUTPUT"
+            echo "::notice::NEON_API_KEY/NEON_PROJECT_ID ausentes — smoke e isolamento PULADOS."
+          fi
+
+  banco:
+    needs: segredos
+    if: needs.segredos.outputs.presentes == 'sim'
+    runs-on: ubuntu-latest
+
+    env:
+      NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
+      NEON_PROJECT_ID: ${{ secrets.NEON_PROJECT_ID }}
+      PR_NUMERO: ${{ github.event.pull_request.number }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      - name: Criar a branch efêmera
+        id: branch
+        run: node scripts/ci-banco.js criar
+
+      # A partir daqui tudo pode falhar — o passo de limpeza lá embaixo roda de
+      # qualquer jeito, porque é `if: always()`.
+
+      - name: Aplicar o schema (papel dono)
+        env:
+          DATABASE_URL_MIGRACAO: ${{ steps.branch.outputs.uri_dono }}
+        run: npm run release
+
+      # O CI usa o MESMO papel restrito que a aplicação usa em produção, e não o
+      # dono. É o que faz erro de permissão aparecer aqui, e não no ar — a mesma
+      # razão pela qual o .env.local de dev usa o papel restrito.
+      #
+      # A senha é gerada pelo próprio script. Alterar o papel aqui não toca em
+      # nenhum outro ambiente: cada branch do Neon é um Postgres independente, e
+      # esta some no fim do job.
+      - name: Criar o papel de menor privilégio
+        env:
+          DATABASE_URL: ${{ steps.branch.outputs.uri_dono }}
+          PAPEL: cutflow_dev_app
+        run: npm run db:papel-app
+
+      - name: Ler a string do papel restrito
+        id: app
+        run: |
+          URI=$(grep -m1 '^postgresql://' .cutflow_dev_app.local)
+          if [ -z "$URI" ]; then
+            echo "::error::db:papel-app não gravou a connection string."
+            exit 1
+          fi
+          echo "::add-mask::$URI"
+          echo "uri=$URI" >> "$GITHUB_OUTPUT"
+
+      # NODE_ENV fica FORA de production aqui, de propósito. Em produção o
+      # cookie de sessão ganha a marca `secure`, e o navegador (ou o fetch do
+      # smoke) só o devolve por HTTPS. Contra `http://localhost`, a sessão
+      # simplesmente não voltaria e o smoke falharia por configuração, não por
+      # bug. O que valida o modo produção de verdade é o serviço cutflow-dev.
+      - name: Subir a API
+        env:
+          DATABASE_URL: ${{ steps.app.outputs.uri }}
+          PORT: "3001"
+          TRUST_PROXY: "0"
+        run: |
+          # JWT_SECRET novo a cada execução; server/auth.js exige 32+ caracteres.
+          JWT_SECRET=$(openssl rand -hex 32); export JWT_SECRET
+          node server/index.js > /tmp/api.log 2>&1 &
+          echo $! > /tmp/api.pid
+          for i in $(seq 1 40); do
+            curl -sf http://localhost:3001/api/health >/dev/null && break
+            sleep 1
+          done
+          if ! curl -sf http://localhost:3001/api/health >/dev/null; then
+            echo "::error::A API não subiu em 40s."
+            cat /tmp/api.log
+            exit 1
+          fi
+          echo "API no ar."
+
+      - name: smoke
+        env:
+          DATABASE_URL: ${{ steps.app.outputs.uri }}
+        run: npm run smoke
+
+      - name: isolamento
+        env:
+          DATABASE_URL: ${{ steps.app.outputs.uri }}
+        run: npm run isolamento
+
+      - name: Log da API (só quando algo falha)
+        if: failure()
+        run: cat /tmp/api.log || true
+
+      # `always()`: branch esquecida é custo e é uma superfície a mais parada no
+      # projeto. O script recusa apagar qualquer coisa que não tenha nascido
+      # aqui — ver a trava em scripts/ci-banco.js.
+      - name: Apagar a branch efêmera
+        if: always()
+        env:
+          NEON_BRANCH_ID: ${{ steps.branch.outputs.branch_id }}
+        run: node scripts/ci-banco.js apagar
