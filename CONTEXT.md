@@ -644,18 +644,65 @@ O que isso muda na prática:
 Não foi alterado agora porque mover o dev para uma branch própria muda as duas
 connection strings da Render e do `.env.local`, e é decisão do dono.
 
-#### O portão para `producao` ainda não é obrigatório
+#### O portão para `producao` — FECHADO em 14/08/2026, no deploy
 
-**Branch protection não está disponível** neste repositório: privado em plano
-free, e a API responde `Upgrade to GitHub Pro`. Ou seja, o PR de `main` para
-`producao` que o `render.yaml` descreve é convenção, e um push direto sobe para
-as barbearias sem CI.
+**Branch protection continua indisponível** neste repositório: privado em plano
+free, e a API responde `Upgrade to GitHub Pro`. O PR de `main` para `producao`
+segue sendo convenção, e um push direto ainda *chega* na branch sem CI.
 
-A saída de custo zero é `autoDeploy: false` no serviço `cutflow` e o deploy
-disparado pelo CI só depois do verde — a trava deixa de ser "não dá para
-mergear" e vira "não dá para deployar", que é o que protege a barbearia. As
-alternativas pagas são GitHub Pro ou tornar o repositório público (e este
-documento descreve a superfície de ataque do sistema).
+O que mudou é o que acontece depois. `autoDeploy: false` no serviço `cutflow`, e
+o deploy sai de `.github/workflows/deploy.yml` só após lint, build, guardas,
+smoke e isolamento passarem. **A trava deixou de ser "não dá para mergear" e
+virou "não dá para deployar"** — que é a que protege a barbearia. Um push direto
+em `producao` continua possível; o que ele não consegue mais é chegar ao ar sem
+passar pela verificação.
+
+Três decisões que valem estar escritas:
+
+- **`workflow_call`, e não etapas copiadas.** O `deploy.yml` chama o `ci.yml` e o
+  `ci-banco.yml`. Verificação duplicada em dois arquivos vira duas verificações
+  diferentes no dia em que alguém mexer só numa — e a esquecida seria justamente
+  a que protege a produção. Pelo mesmo motivo `producao` saiu do gatilho de push
+  do `ci.yml`: quem verifica aquela branch agora é o `deploy.yml`.
+
+- **O `ci-banco` expõe `executado`.** Sem os segredos da Neon ele se declara
+  pulado e termina **verde**, e `needs` só garante que o job não falhou — o
+  deploy leria esse verde como "os testes passaram". O output existe para
+  recusar publicar apoiado em verificação que não aconteceu. Verde por omissão
+  não é permissão.
+
+- **O disparo fixa `ref=<sha>`.** Sem isso a Render publicaria o topo da branch
+  no instante da chamada, que pode já ser outro commit — ainda não verificado —
+  se alguém empurrar durante o job.
+
+A URL do Deploy Hook é uma credencial (o `?key=` é a senha) e vive no segredo
+`RENDER_DEPLOY_HOOK`. É mascarada com `::add-mask::` antes da primeira chamada;
+o log da primeira execução foi conferido e não a contém. Se vazar: Render →
+Settings → Deploy Hook → Regenerate, e atualizar o segredo.
+
+**O serviço de dev segue com deploy automático**, de propósito: o valor dele é
+ver a mudança no ar rápido, e não há barbearia do outro lado. O portão fica onde
+o estrago existe.
+
+##### Por que não tornar o repositório público para ganhar branch protection
+
+Foi avaliado em 14/08/2026 e **descartado**. O repositório tem um colaborador só,
+então branch protection se resumiria a *required status checks* — required
+reviews é inútil quando não há quem revise. E o custo seria permanente:
+
+- fontes Coolvetica versionadas (`CUT FLOW/`, `public/fonts/`) — publicar é
+  redistribuir binário licenciado;
+- `IDVCUTFLOW.ai`, o arquivo editável da marca;
+- **PII de terceiros no histórico**: dois e-mails pessoais reais, um deles de um
+  colaborador que também é autor de commits. Não é decisão de uma pessoa só;
+- **este documento** descreve a superfície de ataque com precisão (o
+  `codigo_acesso` em claro, o alfabeto de 32 símbolos, as 10 tentativas por 15
+  min, o bloqueio de login por e-mail). Nada disso deveria ser secreto, mas
+  publicar baixa o custo do ataque de "engenharia reversa" para "ler a doc".
+
+E é irreversível: forks e clones sobrevivem a voltar para privado. Se um dia
+abrir o código for objetivo de verdade, o caminho passa por reescrever o
+histórico e combinar com o colaborador — não por economizar a assinatura.
 
 ---
 
