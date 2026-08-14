@@ -30,8 +30,21 @@ const opcoesCookie = {
   path: "/",
 };
 
-export function criarSessao(res, barbeiroId) {
-  const token = jwt.sign({ sub: barbeiroId, tipo: TIPO_BARBEIRO }, SECRET, { expiresIn: "7d" });
+// `iat` (segundos epoch) só é passado pela troca de senha, e existe para tirar
+// o relógio do Node da conta.
+//
+// A revogação abaixo compara o `iat` do token com `senha_alterada_em`, que é
+// gravado pelo `now()` do POSTGRES. São dois relógios diferentes: se o do Node
+// estiver alguns milissegundos atrás, o cookie emitido logo após a troca nasce
+// "anterior" a ela e desloga justo quem acabou de trocar a senha. Assinando com
+// o carimbo que o próprio banco devolveu, os dois lados passam a falar do mesmo
+// instante e não sobra folga arbitrária para calibrar.
+export function criarSessao(res, barbeiroId, { iat } = {}) {
+  const conteudo = { sub: barbeiroId, tipo: TIPO_BARBEIRO };
+  // jsonwebtoken respeita um `iat` já presente no payload e calcula o `exp` a
+  // partir dele — os 7 dias continuam contando da emissão.
+  if (iat) conteudo.iat = iat;
+  const token = jwt.sign(conteudo, SECRET, { expiresIn: "7d" });
   res.cookie(COOKIE, token, opcoesCookie);
 }
 
@@ -71,13 +84,43 @@ export async function exigirLogin(req, res, next) {
   }
 
   const [barbeiro] = await sql`
-    select id, nome, barbearia, email, whatsapp
+    select id, nome, barbearia, email, whatsapp, senha_alterada_em
     from barbeiros
     where id = ${payload.sub}
   `;
   if (!barbeiro) {
     encerrarSessao(res);
     return res.status(401).json({ erro: "Conta não encontrada" });
+  }
+
+  // Revogação por troca de senha.
+  //
+  // O JWT é auto-contido: `encerrarSessao` só apaga o cookie do navegador que
+  // pediu, e um token copiado antes disso seguiria valendo os 7 dias inteiros.
+  // Enquanto não havia rota de trocar senha, isso era um limite aceito. Deixou
+  // de ser no momento em que trocar a senha virou a reação a "alguém entrou na
+  // minha conta": a troca precisa derrubar o token que essa pessoa levou.
+  //
+  // Um carimbo por conta resolve sem tabela de sessões: todo token assinado
+  // antes da última troca morre. É por isso que a consulta acima já trazia a
+  // linha do banco a cada requisição — o custo extra aqui é uma coluna.
+  //
+  // A comparação é em segundos inteiros dos dois lados: `iat` do JWT é epoch em
+  // segundos, e a coluna é gravada com `date_trunc('second', now())`. Sem esse
+  // truncamento, o carimbo teria microssegundos, o `iat` arredondado para baixo
+  // ficaria sempre "antes" dele, e o cookie recém-emitido seria recusado na
+  // requisição seguinte.
+  //
+  // Sobra uma janela de menos de um segundo: um token emitido no MESMO segundo
+  // da troca sobrevive. Fechá-la exigiria carimbo com fração e um `iat` que o
+  // JWT não sabe representar — e um segundo não é o que separa quem invadiu a
+  // conta de quem a recuperou.
+  const trocadaEm = barbeiro.senha_alterada_em
+    ? new Date(barbeiro.senha_alterada_em).getTime()
+    : 0;
+  if (trocadaEm && (payload.iat ?? 0) * 1000 < trocadaEm) {
+    encerrarSessao(res);
+    return res.status(401).json({ erro: "Sessão encerrada porque a senha foi alterada." });
   }
 
   req.barbeiroId = barbeiro.id;

@@ -515,7 +515,7 @@ o hash representa.
 
 #### `npm run guardas` — invariante conferido por máquina, não por auditoria
 
-`scripts/guardas.js` transforma em teste cinco coisas que este documento já
+`scripts/guardas.js` transforma em teste sete coisas que este documento já
 afirmava e que só eram verdade no dia da medição:
 
 | Guarda | De onde veio |
@@ -525,6 +525,8 @@ afirmava e que só eram verdade no dia da medição:
 | `dist/` sem `postgresql://`, `neon.tech`, `DATABASE_URL`, `JWT_SECRET` | item 1 do checklist |
 | `engines.node` tem teto | a Render escolhendo Node 26.7.0 |
 | nenhum segredo real em arquivo **versionado** | os dois quase-acidentes de 13/08 (abaixo) |
+| toda rota `/api` fora da lista pública exige `exigirLogin` | análise de 14/08 — nada olhava a porta da frente |
+| cookie `httpOnly` + `SameSite` + `secure`, e **zero CORS** | análise de 14/08 — a proteção de CSRF nascia da soma de três detalhes |
 
 A quinta guarda nasceu no mesmo dia em que foi escrita, e o motivo importa. As
 outras quatro olham o que vai para o **navegador**; esta olha o que vai para o
@@ -541,8 +543,18 @@ A segunda guarda procura pela **forma** (`senha: "algo"`), não pelo nome do
 mecanismo — que foi exatamente o erro que deixou o botão de demo passar por duas
 varreduras. Campo de formulário (`senha: ""`) não casa, de propósito.
 
-**As quatro foram validadas quebrando cada uma de propósito**, e cada uma
-acusou, com saída 1. Teste que não sabe falhar não vale nada.
+**Todas foram validadas quebrando cada uma de propósito**, e cada uma acusou,
+com saída 1. Teste que não sabe falhar não vale nada — e em 14/08 isso deixou de
+ser slogan: a guarda 6 passou verde na primeira execução **sem olhar nada**.
+
+Os arquivos deste projeto estão em CRLF (é escrito no Windows) e, em JavaScript,
+`.` não casa `\r`. Uma expressão terminada em `(.*)$` não casa linha nenhuma num
+arquivo com CRLF: ela não acusa erro, ela **aprova tudo**. Pior, o CI roda em
+Ubuntu com LF, onde a mesma guarda funcionaria — a máquina ficaria verde por
+motivo certo e a máquina de quem desenvolve, verde por motivo errado. A leitura
+de arquivo em `guardas.js` passou a normalizar a quebra de linha (`linhasDe`).
+Guarda que erra para o lado do "passou" é pior do que guarda nenhuma, porque
+ninguém vai conferir.
 
 ### CI com banco — `smoke` e `isolamento` em branch efêmera
 
@@ -617,6 +629,107 @@ disparado pelo CI só depois do verde — a trava deixa de ser "não dá para
 mergear" e vira "não dá para deployar", que é o que protege a barbearia. As
 alternativas pagas são GitHub Pro ou tornar o repositório público (e este
 documento descreve a superfície de ataque do sistema).
+
+---
+
+# Análise de segurança — 14/08/2026
+
+Varredura do servidor, do schema, dos scripts de CI e do histórico do Git.
+
+**O histórico está limpo**: nenhum commit contém chave da Neon, endpoint real ou
+connection string com senha de verdade — só os placeholders do `.env.example`.
+Os quase-acidentes de 13/08 foram pegos antes de virarem commit. `npm audit`:
+zero vulnerabilidades. O repositório é privado.
+
+## Corrigido
+
+### 1. `POST /api/publico/agendar` aceitava lixo e criava agendamento
+
+Era o único furo explorável por um usuário. A rota irmã do painel
+(`server/routes/agenda.js`) sempre conferiu formato de data e hora; a pública só
+conferia se os campos estavam **preenchidos**. Consequências, todas verificadas:
+
+- `data`/`hora` malformados viravam erro do Postgres → **500 com stack no log**,
+  em vez de 400;
+- nada exigia hora da grade nem data futura: dava para marcar às 03:17 do ano
+  passado;
+- serviço ou profissional inexistente **caía no primeiro ativo do catálogo** —
+  um corpo de lixo criava um agendamento de verdade, em qualquer barbearia da
+  plataforma (a listagem pública é aberta).
+
+Agora entrada inválida é 400. O único fallback que sobrou é o legítimo:
+`"Qualquer"` profissional. Há um horizonte de 180 dias, porque agendamento em
+2099 não aparece na agenda do dono e ocupa horário para sempre.
+
+**Cuidado ao mexer:** barbearia sem `equipe` cadastrada devolve o **dono** na
+lista pública de barbeiros, e a tela manda o nome dele de volta. Exigir que o
+profissional esteja na tabela `equipe` quebraria o agendamento em toda conta
+recém-criada — `register` cria unidade, não funcionário. O caso está tratado e
+coberto por smoke.
+
+### 2. Senha mínima de 6, sem troca e sem recuperação
+
+Mínimo agora é **8**, mais recusa de senha só-numérica e de uma lista curta de
+óbvias. Sem exigência de símbolo ou maiúscula de propósito: regra de composição
+produz `Senha@1` e papelzinho no monitor.
+
+**O login não revalida** — quem já tem conta com senha de 6 continua entrando, e
+só esbarra na regra ao trocar. Subir o mínimo não pode trancar do lado de fora
+quem já está dentro.
+
+`POST /api/auth/senha` (autenticada, exige a senha atual) foi criada, com tela em
+`src/painel/Conta.jsx`. Erro de senha atual conta no **mesmo balde** do bloqueio
+de login, senão a rota vira o caminho sem trava para adivinhar a senha de quem
+já teve a sessão roubada.
+
+### 3. JWT sem revogação — resolvido no ponto em que doía
+
+Trocar a senha derruba as **outras** sessões, via a coluna nova
+`barbeiros.senha_alterada_em`: `exigirLogin` recusa todo token assinado antes do
+carimbo. Sem isso, trocar a senha porque alguém entrou na conta não adiantaria
+nada — o token que essa pessoa levou vale 7 dias, e `logout` só apaga o cookie de
+quem pediu.
+
+Detalhe que custou uma volta: o carimbo é gravado com `date_trunc('second',
+now())` (relógio do **Postgres**) e o cookie novo é assinado com esse mesmo valor
+como `iat`. Comparar o relógio do Node com o do Postgres exigia uma folga
+arbitrária — e qualquer folga deixa sobreviver justamente o token que se quer
+matar. Sobra menos de um segundo de janela, documentada em `server/auth.js`.
+
+Contas que existiam antes da migração têm `senha_alterada_em` nulo: **ninguém é
+deslogado** pela migração.
+
+## Riscos aceitos — registrados, não corrigidos
+
+### `codigo_acesso` em texto claro
+
+É a credencial de login do cliente e está em claro na tabela `clientes`. É
+**deliberado e não tem conserto óbvio**: o barbeiro precisa ditá-la no balcão,
+então não pode ser hash. A consequência precisa estar escrita: **quem tiver
+leitura em `clientes` — inclusive o papel `cutflow_app`, que o processo carrega o
+tempo todo — entra como qualquer cliente.**
+
+Compensações: rotacionável em um clique (`POST /clientes/:id/codigo`), ~1 bilhão
+de combinações, e exige acertar telefone **e** código com 10 tentativas por 15
+min.
+
+### Não existe recuperação de senha por e-mail
+
+O projeto não tem canal de envio. Dono que perder a senha continua dependendo de
+intervenção manual no banco — que é exatamente o tipo de operação que faz
+credencial de produção circular por conversa. Resolver exige serviço de e-mail
+(decisão do dono: serviço externo cai na regra do topo deste documento).
+
+### CSRF: sem token, e não precisa — mas agora é afirmado
+
+Não há token CSRF. O caminho está fechado pela soma de três coisas: cookie
+`SameSite=lax`, corpo lido **só** como `application/json`, e ausência de CORS.
+Funciona, e nenhuma rota que muda estado é GET.
+
+O problema de uma proteção que nasce da soma de três detalhes é que qualquer um
+cai sozinho sem quebrar nada visível — um `cors()` acrescentado para calar um
+erro no console, um `sameSite: "none"` copiado de tutorial. **A guarda 7 agora
+afirma os três**, então a queda vira CI vermelho em vez de silêncio.
 
 ---
 
