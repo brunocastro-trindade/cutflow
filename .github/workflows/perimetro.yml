@@ -41,7 +41,7 @@ jobs:
   conferir:
     # O dono mexe onde precisa: a regra existe para quem foi convidado para uma
     # parte do projeto, não para quem responde por ele inteiro.
-    if: github.event.pull_request.author_association != 'OWNER'
+    if: always()  # TESTE: isencao do dono removida so nesta branch
     runs-on: ubuntu-latest
     name: arquivos dentro do território
     steps:

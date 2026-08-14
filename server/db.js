@@ -14,3 +14,5 @@ if (!url) {
 // Tagged template do Neon: tudo que é interpolado vira parâmetro da query
 // (sql`... ${valor}` → $1), então não há como montar SQL por concatenação.
 export const sql = neon(url);
+
+// linha de teste do perimetro — este arquivo esta FORA do territorio
