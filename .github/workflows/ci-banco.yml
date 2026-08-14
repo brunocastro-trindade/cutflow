@@ -27,6 +27,15 @@ name: CI (banco)
 on:
   pull_request:
   workflow_dispatch:
+  # Chamado pelo deploy.yml. O `executado` é o que impede um deploy de sair
+  # apoiado numa verificação que NÃO aconteceu: sem os segredos da Neon este
+  # workflow se declara pulado e termina em verde, e sem este output o deploy
+  # interpretaria esse verde como "os testes passaram".
+  workflow_call:
+    outputs:
+      executado:
+        description: "'sim' quando smoke e isolamento rodaram de verdade"
+        value: ${{ jobs.segredos.outputs.presentes }}
 
 permissions:
   contents: read
