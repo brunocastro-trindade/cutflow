@@ -1,0 +1,115 @@
+# Perímetro do frontend — onde cada colaborador tem território.
+#
+# ── O que este arquivo é, e o que ele NÃO é ──────────────────────────────────
+#
+# O GitHub não tem permissão por caminho: não existe "write, mas só em src/".
+# Permissão é sempre do repositório inteiro. Então a separação entre quem cuida
+# do frontend e quem cuida do servidor não pode ser uma configuração — tem que
+# ser uma verificação, e é esta.
+#
+# Isto é um GUARDA-CORPO contra desvio de escopo e engano, **não** uma barreira
+# de segurança. Duas razões honestas:
+#
+#  1. Num evento `pull_request`, o workflow que roda vem do merge do PR — ou
+#     seja, um PR que altere ESTE arquivo altera o próprio verificador.
+#  2. Quem tem só leitura não faz merge de nada.
+#
+# A barreira de verdade continua sendo o merge, que é do dono. O que este
+# workflow faz é tirar do dono a obrigação de reparar sozinho, no meio de um
+# diff grande, que um arquivo do servidor entrou junto. A máquina aponta.
+#
+# ── A escotilha de emergência ───────────────────────────────────────────────
+#
+# Frontend às vezes PRECISA de uma linha fora do perímetro — uma rota nova no
+# servidor, uma dependência no package.json. Para isso existe a etiqueta
+# `fora-do-perimetro-ok`: com ela no PR, este workflow passa.
+#
+# E ela funciona como controle porque etiquetar exige permissão de triagem ou
+# mais. Quem tem só leitura NÃO consegue etiquetar o próprio PR — precisa pedir.
+# A conversa acontece antes do merge, que é onde ela vale.
+
+name: Perímetro
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  conferir:
+    # O dono mexe onde precisa: a regra existe para quem foi convidado para uma
+    # parte do projeto, não para quem responde por ele inteiro.
+    if: github.event.pull_request.author_association != 'OWNER'
+    runs-on: ubuntu-latest
+    name: arquivos dentro do território
+    steps:
+      - name: Classificar os arquivos tocados
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          LIBERADO: ${{ contains(github.event.pull_request.labels.*.name, 'fora-do-perimetro-ok') }}
+        run: |
+          set -euo pipefail
+
+          gh pr diff "$PR" --repo "$REPO" --name-only > /tmp/tocados.txt
+
+          dentro=""; fora=""; contrato=""
+          # `IFS=` e `read -r`: `CUT FLOW/` tem espaço no nome, e word splitting
+          # partiria o caminho em dois arquivos que não existem.
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              # O território: telas, design system, estáticos e a marca.
+              src/*|public/*|index.html|"CUT FLOW"/*)
+                dentro="${dentro}  ${f}"$'\n'
+                # Dentro do perímetro, mas é o contrato com o servidor: front e
+                # back discordarem sobre nome de campo é falha registrada neste
+                # projeto (é por isso que o smoke existe). Avisa, não barra.
+                case "$f" in src/lib/api.js) contrato="sim" ;; esac
+                ;;
+              *)
+                fora="${fora}  ${f}"$'\n'
+                ;;
+            esac
+          done < /tmp/tocados.txt
+
+          {
+            echo "### Perímetro do PR"
+            echo ""
+            if [ -n "$dentro" ]; then
+              echo "**Dentro do território de frontend:**"
+              echo '```'; printf '%s' "$dentro"; echo '```'
+            fi
+            if [ -n "$fora" ]; then
+              echo "**Fora do território:**"
+              echo '```'; printf '%s' "$fora"; echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -n "$contrato" ]; then
+            echo "::notice file=src/lib/api.js::Este arquivo é o contrato com o servidor. Se um nome de campo mudou aqui, o smoke precisa rodar antes do merge."
+          fi
+
+          if [ -z "$fora" ]; then
+            echo "Todos os arquivos estão dentro do território de frontend."
+            exit 0
+          fi
+
+          if [ "$LIBERADO" = "true" ]; then
+            echo "::notice::Arquivos fora do perímetro, liberados pela etiqueta 'fora-do-perimetro-ok'."
+            printf '%s' "$fora"
+            exit 0
+          fi
+
+          echo "::error::Este PR toca arquivos fora do território de frontend."
+          printf '%s' "$fora"
+          echo ""
+          echo "O perímetro é: src/, public/, index.html e 'CUT FLOW/'."
+          echo "Servidor, banco, scripts, CI e configuração de deploy ficam de fora."
+          echo ""
+          echo "Se a mudança PRECISA sair do perímetro, peça ao dono do repositório"
+          echo "para pôr a etiqueta 'fora-do-perimetro-ok' neste PR."
+          exit 1

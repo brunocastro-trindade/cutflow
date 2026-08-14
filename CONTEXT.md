@@ -684,6 +684,56 @@ Settings → Deploy Hook → Regenerate, e atualizar o segredo.
 ver a mudança no ar rápido, e não há barbearia do outro lado. O portão fica onde
 o estrago existe.
 
+#### Territórios: frontend e o resto (14/08/2026)
+
+`@HugoMartins-D` entrou como desenvolvedor de **frontend e design system**, com
+acesso de **leitura** — contribui por fork, e PR de fork não recebe segredo
+nenhum, então `RENDER_DEPLOY_HOOK`, `NEON_API_KEY` e `NEON_PROJECT_ID` ficam
+fora de alcance, e o deploy também.
+
+**O GitHub não tem permissão por caminho.** Não existe "write, mas só em
+`src/`": permissão é sempre do repositório inteiro. Então a separação de
+território não é configuração, é verificação —
+`.github/workflows/perimetro.yml`.
+
+O perímetro:
+
+| Dentro | Fora |
+| --- | --- |
+| `src/`, `public/`, `index.html`, `CUT FLOW/` | `server/`, `db/`, `scripts/`, `.github/`, `render.yaml`, `package.json`, documentação |
+
+PR que sai do perímetro falha, com a lista do que saiu. A escotilha é a etiqueta
+`fora-do-perimetro-ok` — e ela funciona como controle porque **etiquetar exige
+permissão de triagem ou mais**: quem tem só leitura não etiqueta o próprio PR,
+precisa pedir. A conversa acontece antes do merge, que é onde ela vale.
+
+`src/lib/api.js` fica dentro do perímetro mas emite aviso: é o contrato com o
+servidor, e front e back discordarem sobre nome de campo é falha registrada
+neste projeto — é para isso que o `smoke` existe.
+
+**Isto é guarda-corpo, não barreira.** Num evento `pull_request` o workflow que
+roda vem do merge do PR, então um PR que altere o próprio verificador o
+desativa; e quem tem leitura não faz merge de nada. A barreira continua sendo o
+merge, que é do dono. O que o workflow faz é tirar do dono a obrigação de
+reparar sozinho, no meio de um diff grande, que um arquivo do servidor entrou
+junto.
+
+##### PR de fork passa por menos verificação
+
+Sem os segredos da Neon, o `ci-banco` se declara pulado. Um PR vindo de fork tem
+**lint, build, guardas e perímetro**, mas **não** `smoke` nem `isolamento` — que
+são justamente os que provam comportamento e isolamento entre contas.
+
+Antes de mergear um PR de fork, traga a branch para o repositório e abra um PR
+interno a partir dela; aí o `ci-banco` roda completo. Verde de fork não
+significa o mesmo que verde interno.
+
+##### Por que não CODEOWNERS
+
+Foi considerado e descartado: sem branch protection ele não obriga nada, e
+listar como code owner alguém que tem só leitura produz aviso de "não é um code
+owner válido" na interface do GitHub. Seria um arquivo quebrado sem ganho.
+
 ##### Por que não tornar o repositório público para ganhar branch protection
 
 Foi avaliado em 14/08/2026 e **descartado**. O repositório tem um colaborador só,
