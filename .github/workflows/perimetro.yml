@@ -32,6 +32,12 @@ name: Perímetro
 
 on:
   pull_request:
+    # `labeled`/`unlabeled` além dos três padrão, e isto não é detalhe: a
+    # etiqueta `fora-do-perimetro-ok` é lida do payload do evento, e sem estes
+    # dois tipos pôr a etiqueta não dispara nada. Re-executar o job à mão também
+    # não resolve — a re-execução reusa o payload ANTIGO, sem a etiqueta.
+    # O efeito era a escotilha só funcionar depois de um commit novo no PR.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
 
 permissions:
   contents: read
