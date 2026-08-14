@@ -1,0 +1,123 @@
+# Deploy de PRODUÇÃO — só depois do verde.
+#
+# ── Por que este arquivo existe ──────────────────────────────────────────────
+#
+# Até aqui a Render fazia deploy automático a cada commit que aparecesse na
+# branch `producao` (`autoDeploy` não definido = ligado). Ou seja: qualquer
+# coisa que chegasse lá subia para as barbearias reais, com ou sem CI — e o
+# "portão" do PR de `main` para `producao` era convenção, não trava, porque
+# branch protection não está disponível neste repositório (privado em plano
+# free).
+#
+# Agora `autoDeploy: false` no render.yaml, e o deploy só acontece por este
+# workflow, depois que TODA a verificação passa. A trava deixou de ser "não dá
+# para mergear" e virou "não dá para deployar" — que é a que protege a
+# barbearia. Um push direto em `producao` continua sendo possível; o que ele
+# não consegue mais é chegar no ar sem passar por aqui.
+#
+# ── O que precisa estar configurado ─────────────────────────────────────────
+#
+#   1. Render → serviço `cutflow` → Settings → Auto-Deploy: **No**
+#      (o render.yaml só manda se o serviço for gerenciado pelo Blueprint;
+#       o ajuste no painel é o que vale em qualquer caso)
+#
+#   2. Render → serviço `cutflow` → Settings → Deploy Hook → copiar a URL
+#
+#   3. GitHub → Settings → Secrets and variables → Actions → New repository
+#      secret, com o nome exato `RENDER_DEPLOY_HOOK`
+#
+# A URL do hook É uma credencial: quem a tiver dispara deploy da produção.
+# Se vazar, regenere na Render e atualize o segredo aqui.
+
+name: Deploy (producao)
+
+on:
+  push:
+    branches: [producao]
+
+permissions:
+  contents: read
+
+# `cancel-in-progress: false`: deploy pela metade é pior do que deploy em fila.
+# Se dois pushes chegarem juntos, o segundo espera o primeiro terminar.
+concurrency:
+  group: deploy-producao
+  cancel-in-progress: false
+
+jobs:
+  # As mesmas verificações do CI, chamadas e não copiadas — ver o comentário
+  # sobre `workflow_call` no ci.yml.
+  verificar:
+    uses: ./.github/workflows/ci.yml
+
+  banco:
+    uses: ./.github/workflows/ci-banco.yml
+    # Sem isto o workflow chamado não enxerga NEON_API_KEY nem NEON_PROJECT_ID
+    # e se declararia pulado — que é exatamente o caso que o `executado` pega.
+    secrets: inherit
+
+  publicar:
+    needs: [verificar, banco]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Conferir que os testes de banco rodaram mesmo
+        # `needs` só garante que o job não FALHOU. Um ci-banco pulado por falta
+        # de segredo também termina verde, e deployar apoiado nisso seria
+        # confiar num teste que não existiu.
+        if: needs.banco.outputs.executado != 'sim'
+        run: |
+          echo "::error::smoke e isolamento não rodaram (NEON_API_KEY/NEON_PROJECT_ID ausentes)."
+          echo "::error::Deploy cancelado: não publico apoiado em verificação que não aconteceu."
+          exit 1
+
+      - name: Disparar o deploy na Render
+        env:
+          HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${HOOK:-}" ]; then
+            echo "::error::Segredo RENDER_DEPLOY_HOOK ausente."
+            echo "::error::Render → serviço cutflow → Settings → Deploy Hook, e guarde em"
+            echo "::error::GitHub → Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+
+          # A URL carrega a chave; mascarar ANTES de qualquer chamada garante que
+          # ela não apareça nem numa mensagem de erro do curl.
+          echo "::add-mask::$HOOK"
+
+          # `ref=<sha>` fixa o deploy no commit que acabou de passar na
+          # verificação. Sem isso a Render publicaria o topo da branch no
+          # momento da chamada — que pode já ser outro commit, ainda não
+          # verificado, se alguém empurrar durante o job.
+          case "$HOOK" in
+            *\?*) sep="&" ;;
+            *)    sep="?" ;;
+          esac
+
+          echo "Disparando deploy do commit $SHA..."
+          if ! corpo=$(curl -fsS -X POST "${HOOK}${sep}ref=${SHA}" 2>/tmp/curl.err); then
+            echo "::error::A Render recusou o disparo do deploy."
+            # O stderr do curl pode repetir a URL; o add-mask acima já a redige,
+            # mas passar pelo sed evita depender só disso.
+            sed "s|${HOOK}|<hook>|g" /tmp/curl.err || true
+            exit 1
+          fi
+
+          echo "Deploy aceito pela Render: $corpo"
+          echo "Acompanhe em: https://dashboard.render.com/ (serviço cutflow)"
+
+      - name: Resumo
+        run: |
+          {
+            echo "### Deploy de produção disparado"
+            echo ""
+            echo "- Commit: \`${{ github.sha }}\`"
+            echo "- Verificação: lint, build, guardas, smoke e isolamento — todos verdes"
+            echo "- Destino: https://cutflow-ppdp.onrender.com/"
+            echo ""
+            echo "A Render ainda vai rodar \`npm run release\` (a migração) dentro do build."
+            echo "Se a migração falhar, o build falha e a versão anterior continua servindo."
+          } >> "$GITHUB_STEP_SUMMARY"

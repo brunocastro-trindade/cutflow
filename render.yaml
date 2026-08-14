@@ -60,6 +60,21 @@ services:
     buildCommand: npm ci --include=dev && npm run build && npm run release
     startCommand: npm start
 
+    # Deploy NÃO é automático aqui — quem dispara é o
+    # .github/workflows/deploy.yml, e só depois de lint, build, guardas, smoke
+    # e isolamento passarem.
+    #
+    # Antes disto, qualquer commit que aparecesse em `producao` subia para as
+    # barbearias com ou sem CI: o PR de `main` para `producao` é convenção, não
+    # trava, porque branch protection não está disponível neste repositório
+    # (privado em plano free). A trava deixou de ser "não dá para mergear" e
+    # virou "não dá para deployar", que é a que protege a barbearia.
+    #
+    # ATENÇÃO: esta linha só manda se o serviço for gerenciado pelo Blueprint.
+    # Se ele foi criado pelo painel, o Auto-Deploy de lá é quem vale — desligue
+    # nos dois lugares.
+    autoDeploy: false
+
     # Responde {"ok":true} sem tocar no banco: serve para a Render saber que a
     # instância subiu, e não vira consulta a cada checagem.
     healthCheckPath: /api/health
@@ -94,6 +109,10 @@ services:
 
   # ── DESENVOLVIMENTO ─────────────────────────────────────────────────────────
   # Mesmo código, banco descartável. É aqui que feature nova chega primeiro.
+  #
+  # Este SEGUE com deploy automático, de propósito: o valor de um ambiente de
+  # dev é ver a mudança no ar rápido, e o custo de uma quebra aqui é zero — não
+  # há barbearia do outro lado. O portão fica onde o estrago existe.
   - type: web
     name: cutflow-dev
     runtime: node

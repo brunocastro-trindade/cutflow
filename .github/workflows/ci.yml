@@ -27,7 +27,15 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main, producao]
+    # `producao` saiu daqui de propósito: quem verifica aquela branch é o
+    # deploy.yml, que chama ESTE workflow e só libera o deploy depois do verde.
+    # Mantê-la nos dois faria a mesma verificação rodar duas vezes por push.
+    branches: [main]
+  # Permite que o deploy.yml reaproveite estas etapas em vez de copiá-las.
+  # Verificação duplicada em dois arquivos vira duas verificações diferentes no
+  # dia em que alguém mexer só numa — e a que protege a produção seria
+  # justamente a esquecida.
+  workflow_call:
 
 # Só leitura: este workflow não escreve no repositório, não publica pacote e
 # não toca em deploy. Se um dia precisar, declare a permissão no job, não aqui.
