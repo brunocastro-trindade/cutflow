@@ -83,6 +83,9 @@ export const api = {
     entrar: (dados) => post("/auth/login", dados),
     cadastrar: (dados) => post("/auth/register", dados),
     sair: () => post("/auth/logout"),
+    // Troca a senha do dono. Exige a senha atual e derruba as OUTRAS sessões
+    // (ver server/routes/auth.js); esta aba recebe um cookie novo e continua.
+    trocarSenha: (dados) => post("/auth/senha", dados),
   },
   clientes: {
     listar: () => get("/clientes"),

@@ -310,6 +310,20 @@ update clientes
 create index if not exists clientes_acesso_idx
   on clientes (regexp_replace(telefone, '\D', '', 'g'), codigo_acesso);
 
+-- Quando a senha desta conta foi trocada pela última vez.
+--
+-- É o que permite derrubar sessões: o cookie carrega um JWT auto-contido, e
+-- apagar o cookie de um navegador não invalida a cópia que outra pessoa tenha
+-- levado. `server/auth.js` recusa todo token assinado antes deste carimbo, e
+-- `POST /api/auth/senha` o atualiza — então trocar a senha porque alguém entrou
+-- na conta realmente expulsa essa pessoa, em vez de só mudar o que ela já não
+-- precisa saber.
+--
+-- Nulo (o padrão, e o valor de toda conta que existia antes desta coluna)
+-- significa "nunca trocada": nenhuma sessão é recusada, e as de hoje seguem
+-- valendo. Ninguém é deslogado por causa desta migração.
+alter table barbeiros add column if not exists senha_alterada_em timestamptz;
+
 -- Uma avaliação por cliente em cada barbearia. Sem isto, a mesma pessoa
 -- reavalia em laço e move a média pública da barbearia sozinha.
 -- Duplicatas anteriores: mantém a mais recente e apaga o resto.

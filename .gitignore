@@ -14,6 +14,9 @@ dist-ssr
 
 # Credencial do papel de menor privilégio, gerada por `npm run db:papel-app`.
 .papel-app.local
+.cutflow_app.local
+.cutflow_dev_app.local
+*_app.local
 
 # Segredos: connection string do Neon e chave de sessão
 .env

@@ -1,0 +1,87 @@
+# CI — o que dá para verificar SEM credencial de banco.
+#
+# ── Por que este workflow para aqui ──────────────────────────────────────────
+#
+# O que realmente prova que o sistema funciona são `npm run smoke` e
+# `npm run isolamento`: eles disparam contra a API no ar os mesmos corpos que as
+# telas mandam. Nenhum dos dois roda aqui, e o motivo é técnico, não preguiça:
+#
+# `server/db.js` usa `neon(url)` — o driver HTTP do Neon —, e ele fala com o
+# endpoint da Neon, não com Postgres direto. Um `services: postgres:16` do
+# Actions NÃO serve: o driver não sabe falar com ele. As saídas seriam (a) subir
+# o proxy HTTP da Neon no runner e configurar `neonConfig`, o que exige mexer em
+# `server/db.js`, ou (b) criar uma branch efêmera do Neon por PR, o que exige
+# NEON_API_KEY como segredo.
+#
+# A (b) é a boa, e é literalmente o item 4 do checklist de blindagem em
+# CONTEXT.md ("testar em branch efêmera, não em produção"). Está desenhada e
+# aguardando decisão do dono — segredo novo e serviço externo caem na regra de
+# reporte do topo do CONTEXT.md.
+#
+# Enquanto isso, este workflow cobre o que não precisa de banco: lint, build e
+# as quatro guardas de invariante. Não é o teste completo, e não deve ser
+# confundido com ele.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, producao]
+
+# Só leitura: este workflow não escreve no repositório, não publica pacote e
+# não toca em deploy. Se um dia precisar, declare a permissão no job, não aqui.
+permissions:
+  contents: read
+
+# Push novo na mesma branch cancela a execução anterior — a antiga já não
+# descreve o código que está lá.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verificar:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # As duas pontas de `engines.node` (">=22 <25"). O piso é 22 porque o
+        # código usa `--env-file-if-exists` e `getSetCookie`; o 24 é onde o
+        # projeto é desenvolvido. Testar as duas é o que impede a faixa
+        # declarada de virar ficção.
+        node: [22, 24]
+
+    name: node ${{ matrix.node }}
+
+    steps:
+      # Actions fixadas por SHA, não por tag. Tag em Git é móvel: `@v7` pode
+      # apontar para outro commit amanhã, e este repositório roda com segredos
+      # ao lado. O comentário registra a versão que o SHA representa.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      # `npm ci`, nunca `npm install`: respeita o package-lock, que é o que foi
+      # testado. As dependências estão com `^` e um install solto pode trazer
+      # minor diferente.
+      #
+      # Aqui não precisa do `--include=dev` que o render.yaml exige, porque lá o
+      # NODE_ENV=production vale também para o build e faz o npm pular as
+      # devDependencies (o vite é uma delas). No Actions o NODE_ENV não está
+      # definido, então as dev entram sozinhas.
+      - run: npm ci
+
+      - run: npm run lint
+
+      # Quebra em import inexistente — é o que pega rota renomeada que o front
+      # ainda chama.
+      - run: npm run build
+
+      # Depois do build, de propósito: a guarda 3 varre o `dist/` atrás de
+      # connection string e segredo. Sem build, ela se declara PULADA.
+      - run: npm run guardas

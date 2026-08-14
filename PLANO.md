@@ -1,11 +1,17 @@
 # ControlCRM — Plano, estado e armadilhas
 
-Documento de trabalho. Última atualização: **05/08/2026**.
+Documento de trabalho. Última atualização: **13/08/2026**.
 
 O projeto nasceu como CRM multi-nicho (clínica, barbearia, mecânica) e foi
 reduzido a **barbearia apenas**. Depois virou SaaS multi-inquilino com Postgres
 no Neon. Este arquivo registra o que foi decidido, o que já roda e onde as
 coisas já quebraram — para não quebrarem de novo.
+
+> **Onde cada coisa mora.** Quando este arquivo e o [`CONTEXT.md`](CONTEXT.md)
+> discordarem, **o CONTEXT.md vence** — ele é o canônico, e é onde estão a
+> auditoria de segurança, o checklist de blindagem do banco e a regra de reporte
+> obrigatório. O valor deste arquivo é a seção 4, **Armadilhas já encontradas**:
+> os erros que já custaram tempo aqui.
 
 ---
 
@@ -96,8 +102,12 @@ Serviços, Estoque, Equipe, Assinaturas e Despesas persistem no banco.
 Todo `<select>` de catálogo sai do helper `opcoes()`, que usa **sempre o id
 como valor** — é o que impede a volta do casamento por nome.
 
-O painel deixou de ter modo demonstração; a demo sobrou só na área do cliente,
-onde as rotas `/api/publico/*` ainda não existem.
+O painel deixou de ter modo demonstração.
+
+> **Desatualizado.** Esta etapa dizia que "a demo sobrou só na área do cliente".
+> Não sobrou: `src/lib/demo.js` foi **apagado** em 07/08/2026, junto com o
+> `comQuedaParaDemo` da `api.js`. Hoje API fora do ar é erro visível, não dado
+> inventado. Ver CONTEXT.md, "Acesso: só com conta registrada".
 
 ### Etapa 4 — Organização do front (feito)
 `src/App.jsx` saiu de 2.638 para ~160 linhas. Hoje é só a raiz: sessão,
@@ -122,6 +132,11 @@ gerenciador de senha salvar e preencher. Senha tem olho para revelar. Limite de
 ### Etapa 6 — API Pública para Área do Cliente (feito)
 Criadas as rotas públicas `/api/publico/*` em `server/routes/publico.js` e adicionadas as tabelas `favoritos` e `avaliacoes` ao schema Postgres.
 
+> **Parcialmente desatualizado.** A auditoria de 07/08/2026 reescreveu a
+> autenticação desta área: `/identificar` exige **telefone + código de acesso**
+> (não cria mais cliente), e as rotas por id viraram `/api/publico/eu/*` sob o
+> middleware `exigirCliente`. O contrato válido está no CONTEXT.md.
+
 - `POST /api/publico/identificar`: busca/cria cliente pelo número de WhatsApp;
 - `GET /api/publico/barbearias` e `GET /api/publico/barbearias/:id`: lista e detalha barbearias, serviços e barbeiros;
 - `GET /api/publico/barbearias/:id/horarios`: calcula grade de horários livres x ocupados no dia;
@@ -134,6 +149,29 @@ Criadas as rotas públicas `/api/publico/*` em `server/routes/publico.js` e adic
 - Criado o componente `src/auth/CheckoutPlanos.jsx` para onboarding em 2 passos (Escolha de Plano e Pagamento Simulado);
 - Atualizado o fluxo de entrada do sistema: ao clicar em "Criar conta", o usuário seleciona o plano, confirma o pagamento e a página de cadastro abre com o selo do plano ativo.
 
+### Etapa 9 — Auditoria e blindagem (feito, 07 a 12/08/2026)
+Registrada por inteiro no [`CONTEXT.md`](CONTEXT.md); aqui só o índice.
+
+Autenticação da área do cliente reescrita (telefone + código de acesso), IDOR
+fechado com `/publico/eu/*`, rate limit passando a usar `req.ip`, avaliações com
+restrição de unicidade, atalho de acesso demo e dados de exemplo removidos,
+papel de menor privilégio (`cutflow_app`) em uso, senha do dono do banco
+trocada, e o projeto Neon antigo apagado.
+
+### Etapa 10 — Dois ambientes e CI (feito, 12 a 13/08/2026)
+`main` → `cutflow-dev` (banco descartável) e `producao` → `cutflow` (dados
+reais), pelo [`render.yaml`](render.yaml). Feature nova entra por `main` e só
+chega às barbearias por PR.
+
+CI no GitHub Actions (`.github/workflows/ci.yml`): lint, build e
+`npm run guardas` nos dois extremos da faixa do Node (22 e 24). As guardas
+(`scripts/guardas.js`) transformam em teste quatro invariantes que antes eram só
+regra escrita — front sem variável de ambiente, front sem credencial literal,
+bundle sem segredo, e `engines.node` com teto.
+
+**Pendente:** `smoke` e `isolamento` não rodam no CI (precisam de banco), e nada
+impede push direto em `producao` — ver seção 5.
+
 ---
 
 ## 3. Comandos
@@ -141,12 +179,21 @@ Criadas as rotas públicas `/api/publico/*` em `server/routes/publico.js` e adic
 | Comando | O que faz |
 |---|---|
 | `npm run dev` | API (3001) + front (5173) juntos |
+| `npm run lint` / `npm run build` | Front e servidor |
+| `npm run guardas` | Quatro invariantes de segurança. Não precisa de banco |
+| `npm run smoke` | Contrato real contra a API no ar. **É o que importa** |
+| `npm run isolamento` | Prova que uma conta não alcança dados de outra |
 | `npm run db:migrate` | Aplica o schema. Nunca destrói |
 | `npm run db:reset` | **Destrutivo**. Recusa rodar com dados, salvo `-- --force` |
-| `npm run convite -- "Nome"` | Gera código de cadastro. `-- --listar` mostra todos |
-| `npm run lint` / `npm run build` | Front e servidor |
+| `npm run db:papel-app` | Cria o papel restrito da aplicação |
+| `npm run ensaiar-migracao` | Ensaia a migração contra uma cópia de produção |
 
-Credenciais em `.env.local` (fora do git). Modelo em `.env.example`.
+Credenciais em `.env.local` (fora do git). São **duas** connection strings —
+papel da aplicação e papel dono. Modelo em `.env.example`.
+
+O `npm run convite` continua existindo, mas o **cadastro é aberto** (decisão 6):
+`server/routes/auth.js` não pede convite. A tabela `convites` e o script são
+resíduo da fase de piloto fechado.
 
 ---
 
@@ -212,10 +259,12 @@ vez em `useState(() => ...)` ou fora do componente.
 **`setState` síncrono no corpo de um `useEffect`** também é barrado pelo lint.
 Nos callbacks da promise é permitido — e é o padrão correto.
 
-**Contador de tentativas em memória vira 3 × instâncias.** `server/tentativas.js`
-guarda a contagem num `Map` do processo. É suficiente enquanto for um processo
-só — quem ataca não reinicia o nosso servidor. **No dia em que rodar em mais de
-uma instância, isso precisa ir para o banco**, senão o limite real deixa de ser 3.
+**Contador de tentativas em memória vira 3 × instâncias.** ✅ **Resolvido.** A
+contagem morava num `Map` do processo, e o limite real seria 3 × o número de
+instâncias. Hoje vive na tabela `limites_uso` (`server/limiteStore.js`),
+compartilhada — o que também permitiu escalar para mais de uma instância. O
+preço é uma ida ao banco por requisição limitada, e só as rotas sensíveis
+(`/api/auth`, `/api/publico`) pagam.
 
 **Contar tentativa só para e-mail cadastrado entrega quem está na base.** Se o
 e-mail inexistente nunca bloqueasse, a diferença de comportamento seria um
@@ -245,3 +294,49 @@ confirme no banco antes de sair caçando bug de encoding.
 `.claude/skills/` (ui-ux-pro-max) está no `.gitignore` **de propósito** — não sobe
 com o repositório. Os caminhos de script dos `SKILL.md` vinham quebrados de
 fábrica e foram corrigidos localmente; **`uipro update` desfaz essas correções**.
+
+---
+
+## 5. Pendências conhecidas
+
+Levantadas em 13/08/2026. Nenhuma é bug: são coisas decididas e não feitas, ou
+feitas pela metade — registradas para não virarem surpresa.
+
+### O portão entre dev e produção não é obrigatório
+
+O `render.yaml` diz que nada chega às barbearias sem um PR de `main` para
+`producao`. Hoje isso é convenção, não mecanismo: **branch protection não está
+disponível** neste repositório (privado em plano free — a API do GitHub responde
+`Upgrade to GitHub Pro`). Um push direto em `producao` sobe para as barbearias
+sem passar por CI nenhum.
+
+Três saídas, em ordem de custo:
+
+1. **`autoDeploy: false` no serviço `cutflow`** e disparo do deploy hook pelo CI,
+   só depois do verde. A trava sai de "não dá para mergear" e vira "não dá para
+   deployar" — que é o que de fato protege a barbearia. **Custo zero.**
+2. **GitHub Pro**, que libera branch protection em repositório privado.
+3. **Tornar o repositório público**, que também libera. Atenção: o `CONTEXT.md`
+   descreve a superfície de ataque do sistema, incluindo o que ainda está aberto.
+
+### `smoke` e `isolamento` no CI — escrito, aguardando os segredos
+
+`.github/workflows/ci-banco.yml` roda os dois contra uma branch efêmera do Neon
+(`schema-only`, criada e apagada no job). Falta só configurar `NEON_API_KEY` e
+`NEON_PROJECT_ID` em Settings → Secrets and variables → Actions. Sem eles o
+workflow se declara PULADO em vez de falhar.
+
+**Não foi executado contra a API da Neon ainda** — a primeira execução real vai
+ser o primeiro PR depois dos segredos. Até lá, rode os dois na sua máquina.
+
+### O dev divide o compute com produção
+
+As duas connection strings usam o mesmo endpoint e mudam só o nome do banco. Os dados estão separados, o compute não — e trocar o
+nome do banco na string escreve em produção, que foi como o incidente de 12/08
+aconteceu. Detalhes no CONTEXT.md.
+
+### `docs/` está desatualizado
+
+`docs/HANDOFF-BACKEND.md` e `docs/API-CONTRATO.md` citam `src/lib/demo.js` em
+cinco lugares — arquivo apagado em 07/08/2026 — e descrevem a área do cliente
+antes da correção de autenticação. Não foram revisados nesta passada.

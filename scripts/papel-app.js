@@ -12,7 +12,7 @@
 // de propósito. Por isso a fase de release usa uma variável separada — ver
 // render.yaml.
 //
-// A senha nova é gravada em `.papel-app.local` (ignorado pelo git) em vez de
+// A senha nova é gravada em `.<papel>.local` (ignorado pelo git) em vez de
 // impressa na tela: segredo em terminal vira histórico de shell.
 import { Client } from "@neondatabase/serverless";
 import crypto from "node:crypto";
@@ -21,7 +21,23 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const raiz = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const PAPEL = "cutflow_app";
+
+// Papel no Postgres é do CLUSTER, não do banco. Rodar este script apontando
+// para o banco de dev com o papel de produção trocaria a senha que o site em
+// produção usa — e derrubaria o site. Por isso cada ambiente tem o seu:
+//
+//   npm run db:papel-app                       -> cutflow_app      (produção)
+//   PAPEL=cutflow_dev_app npm run db:papel-app -> cutflow_dev_app  (dev)
+//
+// Credencial separada também vale por si: a de dev vazar não abre produção.
+const PAPEL = process.env.PAPEL || "cutflow_app";
+
+if (!/^[a-z][a-z0-9_]{2,40}$/.test(PAPEL)) {
+  console.error(`
+Nome de papel inválido: ${PAPEL}. Use letras minúsculas, números e _.
+`);
+  process.exit(1);
+}
 
 if (!process.env.DATABASE_URL) {
   console.error("\nDATABASE_URL não definida. Ela precisa ser a string do papel DONO.\n");
@@ -84,7 +100,7 @@ try {
   const u = new URL(process.env.DATABASE_URL);
   u.username = PAPEL;
   u.password = senha;
-  const arquivo = path.join(raiz, ".papel-app.local");
+  const arquivo = path.join(raiz, `.${PAPEL}.local`);
   fs.writeFileSync(arquivo,
     "# Connection string do papel de menor privilégio da aplicação.\n" +
     "# Use esta na variável DATABASE_URL da Render (runtime).\n" +
@@ -92,7 +108,7 @@ try {
     "# Este arquivo está no .gitignore. Apague depois de copiar.\n\n" +
     u.toString() + "\n", { mode: 0o600 });
 
-  console.log(`\nConnection string gravada em .papel-app.local (não foi impressa aqui).`);
+  console.log(`\nConnection string gravada em .${PAPEL}.local (não foi impressa aqui).`);
   console.log("Copie de lá para a Render e apague o arquivo.\n");
 } catch (e) {
   console.error("\nFalhou:", e.message, "\n");

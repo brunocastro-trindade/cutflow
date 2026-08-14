@@ -340,19 +340,85 @@ dependência nova e reescrita de validação em todas as rotas. **Não é urgent
 para injeção de SQL** (as consultas são parametrizadas; 33 payloads reais não
 passaram), e sim para robustez e clareza. Fica como melhoria, não como correção.
 
-### [ ] 6. Rodar a senha do banco — não estava na lista e é o mais urgente
+### [x] 6. Rodar a senha do banco — FEITO em 12/08/2026
 
-A `DATABASE_URL` do banco novo foi colada em conversa e deve ser considerada
-exposta. Enquanto ela valer, todo o resto deste checklist é secundário: quem tem
-a string entra pelo console SQL e nenhuma defesa da aplicação alcança isso.
+A senha do `neondb_owner` foi colada em conversa e valia para o cluster inteiro:
+com ela, trocar o nome do banco na string bastava para abrir produção pelo
+console SQL, e nenhuma defesa da aplicação alcança isso.
 
-Console da Neon → projeto → **Roles** → `neondb_owner` → **Reset password**, e
-atualize a variável na Render.
+Trocada pela API da Neon. Medido depois, e não suposto:
 
-### [ ] 7. Apagar o projeto Neon antigo depois do corte
+```
+velha -> producao              RECUSOU   password authentication failed
+velha -> dev                   RECUSOU   password authentication failed
+nova  -> producao              CONECTOU  neondb_owner @ neondb (barbeiros=4)
+cutflow_app -> producao        CONECTOU  cutflow_app @ neondb (barbeiros=4)
+```
 
-O banco de São Paulo continua de pé, com uma cópia da conta admin. Enquanto os
-dois existirem, é fácil apontar para o errado sem perceber.
+**A troca não derrubou o site**, e isso foi verificado antes de rodar: um
+`pg_stat_activity` em produção mostrou que quem atende requisição é o
+`cutflow_app`, não o dono. O dono só aparece no build, no `npm run release`.
+
+Sobra disso: a variável **`DATABASE_URL_MIGRACAO` da Render está com a senha
+velha**. Enquanto não for atualizada, o site segue no ar normalmente e é o
+próximo *build* que falha, em `npm run release`. A string nova está em
+`.neondb_owner.local` (ignorado pelo git).
+
+### [x] 7. Apagar o projeto Neon antigo — FEITO em 12/08/2026
+
+O projeto de São Paulo tinha uma cópia da conta admin e convidava a apontar para
+o banco errado — já tinha acontecido uma vez neste projeto. Confirmado pela API
+que sumiu: sobrou `cutflow-prod` (Ohio) e um `neon-citron-fence` sem relação,
+criado pela integração da Vercel.
+
+Junto com ele morreram `VITE_NEON_AUTH_URL` e `NEON_AUTH_URL`, que apontavam
+para o endpoint de Neon Auth de lá. Nenhum arquivo do projeto lê essas duas
+variáveis, então nada quebrou — mas a de prefixo `VITE_` era uma armadilha
+armada: bastaria alguém escrever `import.meta.env.VITE_NEON_AUTH_URL` para ela
+passar a ser servida ao navegador. Removidas do `.env.local`.
+
+### Incidente de 12/08/2026 — servidor esquecido apontado para produção
+
+Um `node server/index.js` iniciado em **11/08 às 14:38**, de outra sessão e
+**sem** `--env-file-if-exists=.env.local`, continuou ocupando a porta 3001 com
+credenciais de produção herdadas do shell. Consequências, todas reais:
+
+- Um servidor novo iniciado na mesma porta **não subia** (porta ocupada) e não
+  reclamava em lugar visível. Tudo que se chamava de "localhost" era o antigo.
+- O `npm run isolamento` cria contas **pela API** e limpa pelo `DATABASE_URL`
+  **dele**. Com os dois em bancos diferentes, criou em produção e limpou no dev:
+  imprimiu "contas de teste removidas" tendo apagado nada.
+- "Barbearia A" e "Barbearia B" ficaram listadas na rota pública
+  `/api/publico/barbearias` do site no ar, junto das barbearias reais.
+- O front local do desenvolvedor vinha falando com produção havia um dia.
+
+Removidas em transação, com cópia antes e conferência de que as contas reais
+ficaram idênticas. Junto saiu a conta `priv-teste@local`, que também era lixo de
+teste — e cujo `senha_hash` tinha **1 caractere**, não um hash bcrypt.
+
+Duas travas nasceram daqui:
+
+- **`server/index.js`** passa a registrar no start o `host`, a `base` e o
+  `papel` do banco — nunca a senha. Servidor apontado para o lugar errado agora
+  se denuncia na primeira linha do log.
+- **`scripts/isolamento.js`** recusa rodar se a API enxergar qualquer barbearia
+  que não seja do próprio teste, e explica onde procurar o processo intruso.
+
+A lição não é "matar o processo": é que **um servidor no banco errado era
+indistinguível de um certo**, porque nada dizia para onde ele apontava.
+
+### Como o `.env.local` está agora
+
+Duas credenciais, a mesma separação do `render.yaml`:
+
+| Variável | Papel | Para quê |
+| --- | --- | --- |
+| `DATABASE_URL` | `cutflow_dev_app` | o que a aplicação usa; lê e escreve, não faz DDL |
+| `DATABASE_URL_MIGRACAO` | `neondb_owner` | só o `npm run db:migrate`, que roda DDL |
+
+As duas apontam para o banco **`cutflow_dev`**, nunca para `neondb`. O dev usar
+o mesmo papel restrito da produção é de propósito: erro de permissão aparece na
+máquina antes de aparecer no ar.
 
 ## Deploy
 
@@ -426,13 +492,244 @@ O preço é uma ida ao banco por requisição limitada. Só as rotas sensíveis
 ```bash
 npm run lint      # eslint em src, server e scripts
 npm run build     # falha em import quebrado
+npm run guardas   # quatro invariantes de segurança; NÃO precisa de banco
 npm run db:migrate  # idempotente; aplica db/schema.sql
 npm run smoke     # contrato real contra a API (precisa da API no ar)
+npm run isolamento  # uma conta não alcança dados de outra (precisa da API no ar)
 ```
 
 O `smoke` (`scripts/smoke.js`) é o que importa: dispara contra a API os mesmos
 corpos que as telas mandam e confere os campos que elas leem. É o único ponto do
 projeto que impede front e servidor de voltarem a discordar sobre nomes de campo.
+
+### CI — o que a máquina verifica sozinha (desde 13/08/2026)
+
+`.github/workflows/ci.yml` roda em todo PR e em todo push para `main` e
+`producao`: `lint`, `build` e `guardas`, nos **dois extremos** da faixa
+`engines.node` (22 e 24) — testar as pontas é o que impede a faixa declarada de
+virar ficção.
+
+As actions estão **fixadas por SHA**, não por tag. Tag em Git é móvel: `@v7`
+pode apontar para outro commit amanhã. O comentário ao lado registra qual versão
+o hash representa.
+
+#### `npm run guardas` — invariante conferido por máquina, não por auditoria
+
+`scripts/guardas.js` transforma em teste sete coisas que este documento já
+afirmava e que só eram verdade no dia da medição:
+
+| Guarda | De onde veio |
+| --- | --- |
+| `src/` não lê `import.meta.env` / `VITE_` | item 1 do checklist — a armadilha `VITE_NEON_AUTH_URL` |
+| `src/` não tem credencial literal | o botão "Acessar Painel Demo", removido em 07/08 |
+| `dist/` sem `postgresql://`, `neon.tech`, `DATABASE_URL`, `JWT_SECRET` | item 1 do checklist |
+| `engines.node` tem teto | a Render escolhendo Node 26.7.0 |
+| nenhum segredo real em arquivo **versionado** | os dois quase-acidentes de 13/08 (abaixo) |
+| toda rota `/api` fora da lista pública exige `exigirLogin` | análise de 14/08 — nada olhava a porta da frente |
+| cookie `httpOnly` + `SameSite` + `secure`, e **zero CORS** | análise de 14/08 — a proteção de CSRF nascia da soma de três detalhes |
+
+A quinta guarda nasceu no mesmo dia em que foi escrita, e o motivo importa. As
+outras quatro olham o que vai para o **navegador**; esta olha o que vai para o
+**repositório**, que é caminho diferente e foi percorrido duas vezes numa tarde:
+o endpoint real do Neon foi escrito num documento versionado, e uma API key de
+produção quase foi colada no `.env.example`.
+
+O `.env.example` é a armadilha fina: ele **é versionado**, e o nome promete que é
+só exemplo — é o último lugar onde alguém procuraria um segredo. O `.env.local`
+e os `.<papel>.local` estão ignorados e devem mesmo conter credencial; a guarda
+varre só o que o `git ls-files` lista, então não confunde os dois.
+
+A segunda guarda procura pela **forma** (`senha: "algo"`), não pelo nome do
+mecanismo — que foi exatamente o erro que deixou o botão de demo passar por duas
+varreduras. Campo de formulário (`senha: ""`) não casa, de propósito.
+
+**Todas foram validadas quebrando cada uma de propósito**, e cada uma acusou,
+com saída 1. Teste que não sabe falhar não vale nada — e em 14/08 isso deixou de
+ser slogan: a guarda 6 passou verde na primeira execução **sem olhar nada**.
+
+Os arquivos deste projeto estão em CRLF (é escrito no Windows) e, em JavaScript,
+`.` não casa `\r`. Uma expressão terminada em `(.*)$` não casa linha nenhuma num
+arquivo com CRLF: ela não acusa erro, ela **aprova tudo**. Pior, o CI roda em
+Ubuntu com LF, onde a mesma guarda funcionaria — a máquina ficaria verde por
+motivo certo e a máquina de quem desenvolve, verde por motivo errado. A leitura
+de arquivo em `guardas.js` passou a normalizar a quebra de linha (`linhasDe`).
+Guarda que erra para o lado do "passou" é pior do que guarda nenhuma, porque
+ninguém vai conferir.
+
+### CI com banco — `smoke` e `isolamento` em branch efêmera
+
+`.github/workflows/ci-banco.yml` roda os dois testes que provam **comportamento**,
+contra uma branch do Neon criada e destruída no próprio job. Isto fecha o item 4
+deste checklist ("testar em branch efêmera, não em produção").
+
+Por que uma branch, e não um Postgres do runner: `server/db.js` usa `neon(url)`,
+o driver HTTP, que fala com o endpoint da Neon e não com um Postgres qualquer.
+Um `services: postgres:16` do Actions **não serve** — a alternativa seria subir o
+proxy HTTP da Neon e configurar `neonConfig`, o que obrigaria a mexer em
+`server/db.js`.
+
+**A branch nasce `schema-only`** — estrutura sem dados. Não é detalhe: o
+`isolamento.js` se recusa a rodar se a API enxergar qualquer barbearia que não
+seja do próprio teste (trava nascida do incidente de 12/08), então uma branch com
+dados copiados faria o CI abortar sempre, e com razão. E os dois testes criam e
+apagam contas — rodar isso sobre cópia de dado real é destrutivo por desenho.
+
+É o oposto do `ensaiar-migracao`, que quer os dados justamente para ver a
+migração sobreviver ao que já está gravado. Perguntas diferentes, scripts
+diferentes.
+
+Três decisões do workflow que não são óbvias:
+
+- **O CI usa o papel restrito**, não o dono: `db:papel-app` cria o
+  `cutflow_dev_app` na branch efêmera com senha gerada na hora. Erro de permissão
+  aparece no PR, não no ar. Alterar o papel ali não afeta nada — cada branch do
+  Neon é um Postgres independente.
+- **`NODE_ENV` fica fora de `production`**, ao contrário do `render.yaml`. Em
+  produção o cookie ganha a marca `secure` e só volta por HTTPS; contra
+  `http://localhost` a sessão não voltaria e o smoke falharia por configuração,
+  não por bug. Quem valida o modo produção de verdade é o serviço `cutflow-dev`.
+- **A branch é apagada em `always()`**, e `scripts/ci-banco.js` recusa apagar o
+  que não nasceu ali: só nomes começando em `ci-`, nunca a branch padrão.
+
+**Segredos necessários** (Settings → Secrets and variables → Actions):
+`NEON_API_KEY` e `NEON_PROJECT_ID`. Sem eles o workflow se declara PULADO em vez
+de falhar. **Enquanto não forem configurados, rode `smoke` e `isolamento` na sua
+máquina antes de abrir PR para `producao`.**
+
+### O "banco de dev" é um BANCO, não uma branch do Neon
+
+Corrigido em 13/08/2026. O `render.yaml` diz "branch Neon `dev`", e não é isso
+que está montado: as duas connection strings apontam para o **mesmo endpoint**
+— o mesmo host `ep-...-pooler`, mudando só o nome do banco no fim: `neondb`
+para produção, `cutflow_dev` para desenvolvimento. (Confira você mesmo no
+`.env.local`; o endpoint real não é escrito aqui de propósito, porque este
+arquivo é versionado.)
+
+O que isso muda na prática:
+
+- **A separação de dados é real** — bancos distintos no mesmo cluster não se
+  enxergam, e os papéis são diferentes. O isolamento que interessa está de pé.
+- **A separação de compute não existe.** Os dois dividem o mesmo endpoint: carga
+  ou trava no dev afeta produção. Uma branch de verdade teria compute próprio.
+- **Trocar o nome do banco na string é suficiente para escrever em produção** —
+  que é exatamente como o incidente de 12/08 aconteceu.
+
+Não foi alterado agora porque mover o dev para uma branch própria muda as duas
+connection strings da Render e do `.env.local`, e é decisão do dono.
+
+#### O portão para `producao` ainda não é obrigatório
+
+**Branch protection não está disponível** neste repositório: privado em plano
+free, e a API responde `Upgrade to GitHub Pro`. Ou seja, o PR de `main` para
+`producao` que o `render.yaml` descreve é convenção, e um push direto sobe para
+as barbearias sem CI.
+
+A saída de custo zero é `autoDeploy: false` no serviço `cutflow` e o deploy
+disparado pelo CI só depois do verde — a trava deixa de ser "não dá para
+mergear" e vira "não dá para deployar", que é o que protege a barbearia. As
+alternativas pagas são GitHub Pro ou tornar o repositório público (e este
+documento descreve a superfície de ataque do sistema).
+
+---
+
+# Análise de segurança — 14/08/2026
+
+Varredura do servidor, do schema, dos scripts de CI e do histórico do Git.
+
+**O histórico está limpo**: nenhum commit contém chave da Neon, endpoint real ou
+connection string com senha de verdade — só os placeholders do `.env.example`.
+Os quase-acidentes de 13/08 foram pegos antes de virarem commit. `npm audit`:
+zero vulnerabilidades. O repositório é privado.
+
+## Corrigido
+
+### 1. `POST /api/publico/agendar` aceitava lixo e criava agendamento
+
+Era o único furo explorável por um usuário. A rota irmã do painel
+(`server/routes/agenda.js`) sempre conferiu formato de data e hora; a pública só
+conferia se os campos estavam **preenchidos**. Consequências, todas verificadas:
+
+- `data`/`hora` malformados viravam erro do Postgres → **500 com stack no log**,
+  em vez de 400;
+- nada exigia hora da grade nem data futura: dava para marcar às 03:17 do ano
+  passado;
+- serviço ou profissional inexistente **caía no primeiro ativo do catálogo** —
+  um corpo de lixo criava um agendamento de verdade, em qualquer barbearia da
+  plataforma (a listagem pública é aberta).
+
+Agora entrada inválida é 400. O único fallback que sobrou é o legítimo:
+`"Qualquer"` profissional. Há um horizonte de 180 dias, porque agendamento em
+2099 não aparece na agenda do dono e ocupa horário para sempre.
+
+**Cuidado ao mexer:** barbearia sem `equipe` cadastrada devolve o **dono** na
+lista pública de barbeiros, e a tela manda o nome dele de volta. Exigir que o
+profissional esteja na tabela `equipe` quebraria o agendamento em toda conta
+recém-criada — `register` cria unidade, não funcionário. O caso está tratado e
+coberto por smoke.
+
+### 2. Senha mínima de 6, sem troca e sem recuperação
+
+Mínimo agora é **8**, mais recusa de senha só-numérica e de uma lista curta de
+óbvias. Sem exigência de símbolo ou maiúscula de propósito: regra de composição
+produz `Senha@1` e papelzinho no monitor.
+
+**O login não revalida** — quem já tem conta com senha de 6 continua entrando, e
+só esbarra na regra ao trocar. Subir o mínimo não pode trancar do lado de fora
+quem já está dentro.
+
+`POST /api/auth/senha` (autenticada, exige a senha atual) foi criada, com tela em
+`src/painel/Conta.jsx`. Erro de senha atual conta no **mesmo balde** do bloqueio
+de login, senão a rota vira o caminho sem trava para adivinhar a senha de quem
+já teve a sessão roubada.
+
+### 3. JWT sem revogação — resolvido no ponto em que doía
+
+Trocar a senha derruba as **outras** sessões, via a coluna nova
+`barbeiros.senha_alterada_em`: `exigirLogin` recusa todo token assinado antes do
+carimbo. Sem isso, trocar a senha porque alguém entrou na conta não adiantaria
+nada — o token que essa pessoa levou vale 7 dias, e `logout` só apaga o cookie de
+quem pediu.
+
+Detalhe que custou uma volta: o carimbo é gravado com `date_trunc('second',
+now())` (relógio do **Postgres**) e o cookie novo é assinado com esse mesmo valor
+como `iat`. Comparar o relógio do Node com o do Postgres exigia uma folga
+arbitrária — e qualquer folga deixa sobreviver justamente o token que se quer
+matar. Sobra menos de um segundo de janela, documentada em `server/auth.js`.
+
+Contas que existiam antes da migração têm `senha_alterada_em` nulo: **ninguém é
+deslogado** pela migração.
+
+## Riscos aceitos — registrados, não corrigidos
+
+### `codigo_acesso` em texto claro
+
+É a credencial de login do cliente e está em claro na tabela `clientes`. É
+**deliberado e não tem conserto óbvio**: o barbeiro precisa ditá-la no balcão,
+então não pode ser hash. A consequência precisa estar escrita: **quem tiver
+leitura em `clientes` — inclusive o papel `cutflow_app`, que o processo carrega o
+tempo todo — entra como qualquer cliente.**
+
+Compensações: rotacionável em um clique (`POST /clientes/:id/codigo`), ~1 bilhão
+de combinações, e exige acertar telefone **e** código com 10 tentativas por 15
+min.
+
+### Não existe recuperação de senha por e-mail
+
+O projeto não tem canal de envio. Dono que perder a senha continua dependendo de
+intervenção manual no banco — que é exatamente o tipo de operação que faz
+credencial de produção circular por conversa. Resolver exige serviço de e-mail
+(decisão do dono: serviço externo cai na regra do topo deste documento).
+
+### CSRF: sem token, e não precisa — mas agora é afirmado
+
+Não há token CSRF. O caminho está fechado pela soma de três coisas: cookie
+`SameSite=lax`, corpo lido **só** como `application/json`, e ausência de CORS.
+Funciona, e nenhuma rota que muda estado é GET.
+
+O problema de uma proteção que nasce da soma de três detalhes é que qualquer um
+cai sozinho sem quebrar nada visível — um `cors()` acrescentado para calar um
+erro no console, um `sameSite: "none"` copiado de tutorial. **A guarda 7 agora
+afirma os três**, então a queda vira CI vermelho em vez de silêncio.
 
 ---
 

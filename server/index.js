@@ -150,6 +150,22 @@ app.use((err, req, res, next) => {
   res.status(500).json({ erro: "Erro interno do servidor." });
 });
 
+// Qual banco este processo está usando — host, base e papel, nunca a senha.
+//
+// Sem isto, um servidor apontado para o banco errado é indistinguível de um
+// certo: ele sobe, responde /api/health e só se denuncia quando alguém percebe
+// dado estranho. Foi o que houve em 12/08/2026 — um processo esquecido de outra
+// sessão, com credenciais de produção, atendia a porta 3001 e recebeu dados de
+// teste que acabaram visíveis no site no ar.
+const alvoDoBanco = () => {
+  try {
+    const u = new URL(process.env.DATABASE_URL);
+    return { host: u.hostname, base: u.pathname.slice(1), papel: u.username };
+  } catch {
+    return { host: "?", base: "?", papel: "?" };
+  }
+};
+
 const porta = Number(process.env.PORT) || 3001;
 const servidor = app.listen(porta, () => {
   console.log(JSON.stringify({
@@ -158,6 +174,7 @@ const servidor = app.listen(porta, () => {
     porta,
     ambiente: process.env.NODE_ENV || "development",
     trustProxy: proxies,
+    banco: alvoDoBanco(),
   }));
 });
 
