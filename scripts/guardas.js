@@ -39,11 +39,24 @@ function arquivos(dir, filtro = () => true) {
     .filter(filtro);
 }
 
+/** Lê um arquivo em linhas, sem o `\r` do CRLF.
+ *
+ * O `\r` não é detalhe cosmético aqui. Este projeto é escrito no Windows e
+ * roda em CI no Ubuntu, então o mesmo arquivo tem finais de linha diferentes
+ * nos dois lugares — e, em JavaScript, `.` NÃO casa `\r`. Uma guarda que
+ * termine em `(.*)$` simplesmente não casa linha nenhuma quando o arquivo veio
+ * com CRLF: ela não acusa erro, ela aprova tudo. Foi o que aconteceu com a
+ * guarda 6 na primeira versão — passava verde no Windows sem olhar nada, e só
+ * teria funcionado no CI. Guarda que falha para o lado do "passou" é pior do
+ * que guarda nenhuma, porque ninguém vai conferir.
+ */
+const linhasDe = (arq) => fs.readFileSync(arq, "utf8").split(/\r?\n/);
+
 /** Procura um padrão em vários arquivos e devolve "caminho:linha  trecho". */
 function procurar(lista, padrao) {
   const achados = [];
   for (const arq of lista) {
-    const linhas = fs.readFileSync(arq, "utf8").split("\n");
+    const linhas = linhasDe(arq);
     linhas.forEach((linha, i) => {
       if (padrao.test(linha)) {
         achados.push(`${path.relative(raiz, arq)}:${i + 1}  ${linha.trim().slice(0, 100)}`);
@@ -173,6 +186,98 @@ console.log("\n── Guardas de invariante ────────────
       achados.join("\n")
     );
   }
+}
+
+// ── 6. Toda rota de dados exige sessão ───────────────────────────────────────
+//
+// As guardas 1–5 olham segredo: o que vai ao navegador e o que vai ao
+// repositório. Nenhuma olhava a porta da frente.
+//
+// `server/index.js` monta as rotas em duas faixas: as abertas (health, auth,
+// área do cliente) e, da linha do `exigirLogin` para baixo, tudo que devolve
+// dado de barbearia. Esquecer o middleware ao montar uma rota nova é uma
+// regressão de UMA linha, que não quebra teste nenhum, não muda a cara da tela
+// e expõe a tabela inteira de quem a chamar sem cookie.
+//
+// `scripts/isolamento.js` cobre a pergunta vizinha — se uma conta alcança dado
+// de outra —, mas precisa de banco e da API no ar. Esta lê um arquivo.
+//
+// A lista de abertas é explícita de propósito: rota pública nova só passa
+// depois de alguém vir aqui e escrevê-la, que é exatamente a pausa que a
+// decisão merece.
+{
+  const ABERTAS = new Set([
+    "/api/health",                  // só {"ok":true}, não toca no banco
+    "/api/auth",                    // login e cadastro, sob limitAuth
+    "/api/publico",                 // área do cliente: tem o próprio exigirCliente
+    "/api/publico/identificar",     // só monta o rate limit mais estrito
+    "/api",                         // o 404 final
+  ]);
+
+  // Todas as montagens em index.js são de uma linha só, então a varredura é
+  // por linha — mais previsível do que uma expressão tentando casar parênteses
+  // equilibrados através de várias.
+  const semSessao = [];
+  linhasDe(path.join(raiz, "server", "index.js")).forEach((linha, i) => {
+    const m = linha.match(/^\s*app\.(?:use|get|post|patch|put|delete)\(\s*["'](\/api[^"']*)["']\s*(.*)$/);
+    if (!m) return;
+    const [, caminho, resto] = m;
+    if (ABERTAS.has(caminho)) return;
+    if (/exigirLogin/.test(resto)) return;
+    semSessao.push(`server/index.js:${i + 1}  ${linha.trim().slice(0, 100)}`);
+  });
+
+  ok(
+    semSessao.length === 0,
+    "toda rota /api fora da lista pública exige sessão (exigirLogin)",
+    semSessao.length
+      ? `${semSessao.join("\n")}\n\nSe a rota é MESMO pública, acrescente o caminho à lista ABERTAS nesta guarda.`
+      : ""
+  );
+}
+
+// ── 7. As travas da sessão continuam de pé ───────────────────────────────────
+//
+// Hoje o projeto não tem token CSRF, e não precisa: três coisas somadas fecham
+// o caminho — o cookie é `SameSite`, o corpo só é lido como `application/json`
+// (um formulário de outro site não consegue produzir esse content-type sem
+// passar pelo preflight), e não existe CORS liberando origem nenhuma.
+//
+// O problema de proteção que nasce da soma de três detalhes é que qualquer um
+// deles pode cair sozinho, sem quebrar nada visível: um `cors()` acrescentado
+// para "resolver" um erro no console, ou um `sameSite: "none"` copiado de um
+// tutorial, e a defesa some sem deixar rastro. Esta guarda transforma os três
+// em afirmação.
+{
+  const authJs = fs.readFileSync(path.join(raiz, "server", "auth.js"), "utf8");
+
+  ok(/httpOnly:\s*true/.test(authJs),
+    "cookie de sessão é httpOnly (fora do alcance de JS no navegador)",
+    "server/auth.js: opcoesCookie precisa de httpOnly: true");
+
+  ok(/sameSite:\s*["'](lax|strict)["']/.test(authJs),
+    "cookie de sessão é SameSite lax ou strict",
+    "server/auth.js: `sameSite: \"none\"` (ou ausente) reabre o caminho de CSRF.");
+
+  ok(/secure:\s*process\.env\.NODE_ENV\s*===\s*["']production["']/.test(authJs),
+    "cookie de sessão exige HTTPS em produção",
+    "server/auth.js: sem `secure`, o cookie de sessão trafega em HTTP puro.");
+
+  const pkg = JSON.parse(fs.readFileSync(path.join(raiz, "package.json"), "utf8"));
+  const temPacoteCors = Boolean(pkg.dependencies?.cors || pkg.devDependencies?.cors);
+  const usaCors = procurar(
+    arquivos(path.join(raiz, "server"), (f) => f.endsWith(".js")),
+    /\bcors\s*\(|access-control-allow-origin/i
+  );
+  ok(
+    !temPacoteCors && usaCors.length === 0,
+    "a API não habilita CORS (só a própria origem fala com ela)",
+    [temPacoteCors ? "package.json declara o pacote `cors`" : "", ...usaCors].filter(Boolean).join("\n")
+  );
+
+  ok(/express\.json\(/.test(fs.readFileSync(path.join(raiz, "server", "index.js"), "utf8")),
+    "o corpo das requisições só é lido como JSON",
+    "server/index.js: trocar express.json por urlencoded deixaria um formulário de outro site postar aqui.");
 }
 
 console.log(

@@ -320,6 +320,57 @@ try {
   `;
   ok(qtd === 1, "e continua existindo UMA avaliação, não duas", qtd);
 
+  console.log("\n── Agendamento público: entrada validada ────────────────");
+  //
+  // Esta rota é o único lugar em que uma sessão de CLIENTE escreve na agenda de
+  // uma barbearia — e de qualquer uma, porque a listagem é aberta. Ela só
+  // conferia se `data` e `hora` estavam preenchidas: valor malformado virava
+  // 500, hora fora da grade entrava, data passada entrava, e serviço ou
+  // profissional inexistente CAÍA no primeiro ativo do catálogo — um corpo de
+  // lixo criava agendamento de verdade. A sessão de cliente segue ativa do
+  // bloco acima.
+  const daquiA = (dias) => {
+    const d = new Date();
+    d.setDate(d.getDate() + dias);
+    return d.toISOString().slice(0, 10);
+  };
+  // Três dias de margem para os dois lados: o servidor decide "hoje" no fuso de
+  // Brasília e o CI roda em UTC, então ±1 dia poderia cair no mesmo dia.
+  const futuro = daquiA(3);
+  const pedido = { barbearia_id: barbeiroId, servico: "Corte + Barba", profissional: "Lucas Silva" };
+
+  const dataRuim = await chamar("POST", "/publico/agendar", { ...pedido, data: "31/12/2026", hora: "14:00" });
+  ok(dataRuim.status === 400, "agendar: data fora do formato ISO é 400, não 500", dataRuim.status);
+
+  const horaRuim = await chamar("POST", "/publico/agendar", { ...pedido, data: futuro, hora: "03:17" });
+  ok(horaRuim.status === 400, "agendar: hora fora da grade é recusada", horaRuim.status);
+
+  const noPassado = await chamar("POST", "/publico/agendar", { ...pedido, data: daquiA(-3), hora: "14:00" });
+  ok(noPassado.status === 400, "agendar: data passada é recusada", noPassado.status);
+
+  const muitoLonge = await chamar("POST", "/publico/agendar", { ...pedido, data: daquiA(400), hora: "14:00" });
+  ok(muitoLonge.status === 400, "agendar: data além do horizonte é recusada", muitoLonge.status);
+
+  const svcFantasma = await chamar("POST", "/publico/agendar", { ...pedido, servico: "Servico Inexistente", data: futuro, hora: "14:00" });
+  ok(svcFantasma.status === 400, "agendar: serviço inexistente é 400 (não cai no primeiro do catálogo)", svcFantasma);
+
+  const profFantasma = await chamar("POST", "/publico/agendar", { ...pedido, profissional: "Ninguem Com Esse Nome", data: futuro, hora: "14:00" });
+  ok(profFantasma.status === 400, "agendar: profissional inexistente é 400 (não cai no primeiro da equipe)", profFantasma);
+
+  const valido = await chamar("POST", "/publico/agendar", { ...pedido, data: futuro, hora: "14:00" });
+  ok(valido.status === 201 && valido.dados?.profissional === "Lucas Silva",
+    "agendar: pedido válido continua passando, com o barbeiro pedido", valido);
+
+  // Sem nome fixo na asserção: a seção de unidades acima já cadastrou outros
+  // funcionários, e "o primeiro ativo" agora é o primeiro em ordem de NOME —
+  // determinístico, ao contrário do `limit 1` sem `order by` que havia antes.
+  // O que importa é que caiu em alguém de verdade, e não no literal "Qualquer"
+  // que a versão anterior gravava na agenda quando não achava ninguém.
+  const equipeAtiva = (await chamar("GET", "/publico/barbearias/" + barbeiroId)).dados?.barbeiros || [];
+  const qualquer = await chamar("POST", "/publico/agendar", { ...pedido, profissional: "Qualquer", data: futuro, hora: "15:00" });
+  ok(qualquer.status === 201 && equipeAtiva.some(b => b.nome === qualquer.dados?.profissional),
+    "agendar: 'Qualquer' cai num barbeiro ativo de verdade", { veio: qualquer.dados?.profissional, ativos: equipeAtiva.map(b => b.nome) });
+
   // O token de cliente não pode virar sessão de dono.
   const tokenCliente = cookie.match(/cc_cliente=([^;]+)/)?.[1];
   cookie = `cc_sessao=${tokenCliente}`;
@@ -330,6 +381,61 @@ try {
   cookie = "";
   const semSessao = await chamar("GET", "/clientes");
   ok(semSessao.status === 401, "sem cookie, nada é lido", semSessao);
+
+  console.log("\n── Senha: política e troca ──────────────────────────────");
+  // Mesmo motivo da limpeza no início do arquivo: as seções acima já gastaram
+  // boa parte do balde de /api/auth (20 por 15 min), e o que vem agora é
+  // justamente mais /api/auth. Sem isto o bloco falharia por 429, sem nada
+  // estar quebrado.
+  await sql`delete from limites_uso where chave like 'ip:auth:%'`;
+
+  cookie = "";
+  const senhaCurta = await chamar("POST", "/auth/register", {
+    nome: "Dono Fraco", barbearia: "Teste Senha Curta", whatsapp: "(11) 90000-1111",
+    email: `curta-${Date.now()}@teste.local`, senha: "123456",
+  });
+  ok(senhaCurta.status === 400, "cadastro com senha de 6 caracteres é recusado (o mínimo subiu para 8)", senhaCurta);
+
+  const soDigitos = await chamar("POST", "/auth/register", {
+    nome: "Dono Numerico", barbearia: "Teste Numeros", whatsapp: "(11) 90000-2222",
+    email: `num-${Date.now()}@teste.local`, senha: "12345678",
+  });
+  ok(soDigitos.status === 400, "cadastro com senha só de números é recusado", soDigitos);
+
+  // ── Troca de senha ──────────────────────────────────────────────────────────
+  //
+  // O ponto que importa é o último: trocar a senha derruba as OUTRAS sessões.
+  // Sem isso, trocar a senha porque alguém entrou na conta não adianta nada —
+  // o JWT que essa pessoa levou vale 7 dias e `logout` só apaga o cookie de
+  // quem pediu.
+  cookie = cookieDono;
+  const antesDaTroca = await chamar("GET", "/auth/me");
+  ok(antesDaTroca.status === 200, "a sessão do dono vale antes da troca", antesDaTroca.status);
+
+  const atualErrada = await chamar("POST", "/auth/senha", { atual: "nao-e-esta", nova: "trocada-com-folga-2026" });
+  ok(atualErrada.status === 401, "trocar a senha sem acertar a atual é 401", atualErrada.status);
+
+  const novaFraca = await chamar("POST", "/auth/senha", { atual: "segredo123", nova: "1234" });
+  ok(novaFraca.status === 400, "a senha nova também passa pela política", novaFraca.status);
+
+  const cookieAntigo = cookie;
+  const trocou = await chamar("POST", "/auth/senha", { atual: "segredo123", nova: "trocada-com-folga-2026" });
+  ok(trocou.status === 200, "trocar a senha com a atual correta funciona", trocou);
+  ok(cookie !== cookieAntigo, "a troca emite um cookie novo para esta aba");
+
+  const depoisDaTroca = await chamar("GET", "/auth/me");
+  ok(depoisDaTroca.status === 200, "quem trocou a senha continua logado nesta aba", depoisDaTroca.status);
+
+  cookie = cookieAntigo;
+  const sessaoVelha = await chamar("GET", "/auth/me");
+  ok(sessaoVelha.status === 401, "o token anterior à troca deixa de valer (as outras sessões caem)", sessaoVelha.status);
+
+  cookie = "";
+  const comSenhaVelha = await chamar("POST", "/auth/login", { email, senha: "segredo123" });
+  ok(comSenhaVelha.status === 401, "a senha antiga não entra mais", comSenhaVelha.status);
+
+  const comSenhaNova = await chamar("POST", "/auth/login", { email, senha: "trocada-com-folga-2026" });
+  ok(comSenhaNova.status === 200, "a senha nova entra", comSenhaNova.status);
 } catch (e) {
   console.error("\nErro inesperado:", e);
   falhas++;

@@ -15,6 +15,23 @@ const limpaTelefone = (t) => String(t || "").replace(/\D/g, "");
 const eUUID = (str) =>
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(str || ""));
 
+const DATA_ISO = /^\d{4}-\d{2}-\d{2}$/;
+
+// Hoje em Brasília, como 'YYYY-MM-DD'.
+//
+// O resto do projeto pergunta isso ao Postgres
+// (`(now() at time zone 'America/Sao_Paulo')::date`). Aqui a resposta é
+// necessária ANTES de tocar no banco, para recusar a requisição sem gastar
+// consulta — e `new Date()` sozinho daria o dia em UTC, que vira o dia seguinte
+// depois das 21h de Brasília. `en-CA` é o locale que formata em ISO.
+const hojeEmBrasilia = () =>
+  new Intl.DateTimeFormat("en-CA", { timeZone: "America/Sao_Paulo" }).format(new Date());
+
+// Até onde a agenda pública aceita marcação. Sem teto, uma sessão de cliente
+// pode semear agendamentos em 2099 — que ninguém vê na tela do dono (a agenda
+// abre na semana corrente) e ficam ocupando horário para sempre.
+const HORIZONTE_DIAS = 180;
+
 // Iniciais e cor do selo da barbearia, derivadas do nome.
 //
 // A tela desenha um quadrado com a sigla sobre um degradê (ver LogoLoja em
@@ -228,57 +245,117 @@ router.get("/barbearias/:barbeariaId/horarios", async (req, res) => {
 //
 // `cliente_id` não vem mais do corpo: vem do cookie de sessão. Antes, mandar o
 // id de outra pessoa criava agendamento no nome dela.
+//
+// ── Por que a validação aqui é tão estrita quanto a do painel ────────────────
+//
+// Esta rota é o único ponto do sistema em que um visitante autenticado como
+// CLIENTE escreve na agenda de uma barbearia — e de QUALQUER barbearia, porque
+// a listagem pública é aberta. A rota irmã do painel (server/routes/agenda.js)
+// sempre conferiu formato de data e hora; aqui só se conferia se os campos
+// estavam preenchidos, e o resto ia direto para o banco:
+//
+//   • `data` e `hora` malformados viravam erro do Postgres → 500 com stack no
+//     log, em vez de um 400 que a tela sabe mostrar;
+//   • nada exigia que a hora fosse uma das da grade, nem que a data fosse
+//     futura: dava para marcar às 03:17 de um dia do ano passado;
+//   • serviço ou profissional inexistente CAÍA no primeiro ativo da barbearia,
+//     então um corpo de lixo ainda criava um agendamento de verdade.
+//
+// A restrição `agendamentos_sem_sobreposicao` impedia empilhar tudo no mesmo
+// horário, mas não impedia varrer a grade. Agora entrada inválida é 400, e o
+// único fallback que sobrou é o legítimo: "Qualquer" profissional.
 router.post("/agendar", exigirCliente, async (req, res) => {
   const { barbearia_id, servico, profissional, data, hora } = req.body || {};
   if (!eUUID(barbearia_id)) return res.status(400).json({ erro: "Selecione a barbearia." });
-  if (!data || !hora) return res.status(400).json({ erro: "Selecione data e horário." });
+
+  if (!DATA_ISO.test(String(data || ""))) {
+    return res.status(400).json({ erro: "Data inválida." });
+  }
+  // A grade de horários é fixa e a própria rota /horarios só oferece estes —
+  // aceitar qualquer 'HH:MM' deixaria marcar num horário que a barbearia não
+  // atende e que nenhuma tela mostra.
+  if (!ESFERA_HORARIOS.includes(String(hora || ""))) {
+    return res.status(400).json({ erro: "Horário inválido." });
+  }
+
+  // Comparação de texto: as duas pontas são 'YYYY-MM-DD', formato em que a
+  // ordem alfabética e a cronológica coincidem.
+  const hoje = hojeEmBrasilia();
+  if (data < hoje) return res.status(400).json({ erro: "Não é possível marcar em data passada." });
+
+  const limite = new Date(`${hoje}T00:00:00Z`);
+  limite.setUTCDate(limite.getUTCDate() + HORIZONTE_DIAS);
+  if (data > limite.toISOString().slice(0, 10)) {
+    return res.status(400).json({ erro: "Esta data está longe demais para marcar agora." });
+  }
 
   const cliente = req.cliente;
 
-  let [svc] = await sql`
+  // Sem fallback: serviço que não é desta barbearia (ou não existe) é erro de
+  // quem mandou, não convite para escolher outro no lugar dele.
+  const [svc] = await sql`
     select id, nome, duracao_min, preco::float8, comissao_pct::float8
     from servicos
     where (id::text = ${String(servico)} or lower(nome) = ${String(servico || "").toLowerCase()})
       and barbeiro_id = ${barbearia_id}
+      and ativo = true
     limit 1
   `;
+  if (!svc) return res.status(400).json({ erro: "Serviço não encontrado nesta barbearia." });
 
-  if (!svc) {
-    const [pSvc] = await sql`
-      select id, nome, duracao_min, preco::float8, comissao_pct::float8
-      from servicos
-      where barbeiro_id = ${barbearia_id} and ativo = true
-      limit 1
-    `;
-    svc = pSvc;
-  }
-  if (!svc) return res.status(400).json({ erro: "Esta barbearia não possui serviços ativos cadastrados." });
+  // ── Quem vai atender ─────────────────────────────────────────────────────────
+  //
+  // Três casos, e o terceiro é o que quase virou uma regressão aqui:
+  //
+  //   a) "Qualquer" (padrão da tela) → o primeiro barbeiro ativo.
+  //   b) um barbeiro específico da equipe → tem que existir e estar ativo.
+  //   c) barbearia SEM equipe cadastrada → o dono atende.
+  //
+  // O (c) não é caso de borda: `register` cria a conta com uma unidade e
+  // NENHUM funcionário, e a ficha pública devolve o próprio dono na lista de
+  // barbeiros quando `equipe` está vazia (ver a rota 3 acima). A tela manda o
+  // nome dele de volta, e ele não está na tabela `equipe` — exigir que
+  // estivesse tornaria impossível marcar em toda barbearia recém-cadastrada.
+  //
+  // Nos três casos `equipe_id` pode ser null (é o que já acontecia): o nome
+  // fica congelado em `equipe_nome`, que é o que a agenda do dono mostra.
+  const [barbearia] = await sql`
+    select id, nome, barbearia, whatsapp from barbeiros where id = ${barbearia_id}
+  `;
+  if (!barbearia) return res.status(404).json({ erro: "Barbearia não encontrada." });
 
-  let eqId = null;
-  let eqNome = String(profissional || "Qualquer");
+  const pediuQualquer = !profissional || String(profissional) === "Qualquer";
+  const pedido = String(profissional ?? "");
 
-  const [eq] = await sql`
+  const equipeAtiva = await sql`
     select id, nome
     from equipe
-    where (id::text = ${String(profissional)} or lower(nome) = ${String(profissional || "").toLowerCase()})
-      and barbeiro_id = ${barbearia_id}
-    limit 1
+    where barbeiro_id = ${barbearia_id} and ativo = true
+    order by nome
   `;
 
-  if (eq) {
+  let eqId = null;
+  let eqNome;
+
+  if (!equipeAtiva.length) {
+    // Caso (c): só o dono atende. Aceita "Qualquer" ou o nome/id dele —
+    // qualquer outra coisa continua sendo 400.
+    const eDono =
+      pediuQualquer ||
+      pedido === barbearia.id ||
+      pedido.toLowerCase() === String(barbearia.nome || "").toLowerCase();
+    if (!eDono) return res.status(400).json({ erro: "Profissional não encontrado nesta barbearia." });
+    eqNome = barbearia.nome || "Proprietário";
+  } else if (pediuQualquer) {
+    eqId = equipeAtiva[0].id;
+    eqNome = equipeAtiva[0].nome;
+  } else {
+    const eq = equipeAtiva.find(
+      (e) => e.id === pedido || e.nome.toLowerCase() === pedido.toLowerCase()
+    );
+    if (!eq) return res.status(400).json({ erro: "Profissional não encontrado nesta barbearia." });
     eqId = eq.id;
     eqNome = eq.nome;
-  } else {
-    const [pEq] = await sql`
-      select id, nome
-      from equipe
-      where barbeiro_id = ${barbearia_id} and ativo = true
-      limit 1
-    `;
-    if (pEq) {
-      eqId = pEq.id;
-      eqNome = pEq.nome;
-    }
   }
 
   try {
@@ -296,10 +373,9 @@ router.post("/agendar", exigirCliente, async (req, res) => {
                 valor::float8, status
     `;
 
-    const [b] = await sql`select id, nome, barbearia, whatsapp from barbeiros where id = ${barbearia_id}`;
     res.status(201).json({
       ...novo,
-      barbearia: b ? resumoBarbearia(b, { contato: true }) : null,
+      barbearia: resumoBarbearia(barbearia, { contato: true }),
     });
   } catch (e) {
     if (e.message?.includes("agendamentos_sem_sobreposicao")) {
