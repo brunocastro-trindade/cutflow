@@ -17,6 +17,15 @@
 # para o banco de produção derruba justamente o isolamento que este arquivo
 # existe para criar.
 
+# ── Onde cada um atende ───────────────────────────────────────────────────────
+#
+#   cutflow      → https://cutflow-ppdp.onrender.com/
+#   cutflow-dev  → serviço `cutflow-dev` na Render
+#
+# O sufixo `-ppdp` é gerado pela Render e NÃO sai do `name` abaixo: quem tentar
+# `cutflow.onrender.com` bate em nada. Está escrito aqui porque verificar um
+# deploy exige a URL, e ela não vem deste arquivo.
+
 services:
   # ── PRODUÇÃO ────────────────────────────────────────────────────────────────
   - type: web

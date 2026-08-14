@@ -422,6 +422,33 @@ máquina antes de aparecer no ar.
 
 ## Deploy
 
+### Onde os dois ambientes atendem
+
+| Ambiente | Branch | URL |
+| --- | --- | --- |
+| **Produção** (barbearias reais) | `producao` | <https://cutflow-ppdp.onrender.com/> |
+| Desenvolvimento | `main` | serviço `cutflow-dev` na Render |
+
+**O sufixo `-ppdp` é gerado pela Render e não sai do nome em `render.yaml`.**
+Está escrito aqui porque não estava em lugar nenhum: em 14/08/2026 a verificação
+de um deploy parou justamente nisso — `cutflow.onrender.com` não responde, e
+não há como deduzir o endereço certo a partir do repositório.
+
+Sondagens que verificam um deploy sem criar nada:
+
+```
+GET  /api/health                → {"ok":true}, sem tocar no banco
+GET  /api/publico/barbearias    → prova o caminho aplicação→banco
+                                  (a listagem deve vir com telefone: "")
+```
+
+Como `npm run release` roda dentro do `buildCommand`, **código novo no ar implica
+migração aplicada**: se a migração falha, o build falha e a versão anterior
+continua servindo.
+
+O plano free hiberna após ~15 min sem tráfego — a primeira requisição pode levar
+~50 s. Um `curl` que parece travado normalmente é isso, não queda.
+
 ### Variáveis obrigatórias
 
 | Variável | Valor | Por quê |
