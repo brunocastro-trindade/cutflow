@@ -32,6 +32,17 @@ name: Perímetro
 
 on:
   pull_request:
+    # `labeled`/`unlabeled` além dos três padrão, e isto não é detalhe.
+    #
+    # A etiqueta é lida do payload do evento. Sem estes dois tipos, PÔR a
+    # etiqueta não dispara nada — e re-executar o job à mão também não resolve,
+    # porque a re-execução reusa o payload ANTIGO, de quando não havia etiqueta.
+    # O efeito era a escotilha só passar a valer depois de um commit novo no PR,
+    # o que a tornaria irritante o bastante para alguém desligar a guarda.
+    #
+    # Medido: com estes tipos, tirar e recolocar a etiqueta faz o check ir de
+    # falha para sucesso sozinho, sem commit nenhum no meio.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
 
 permissions:
   contents: read
