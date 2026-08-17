@@ -35,19 +35,62 @@ ser respondida em um comando, e não com sete `grep`.
 
 ## Estado da instalação
 
-**A ferramenta ainda NÃO está instalada neste ambiente.** Este arquivo é a
-adaptação da skill; instalar é um passo separado e deve ser aprovado por quem
-mantém o projeto.
+**Instalada em 17/08/2026, a pedido explícito do usuário, depois de aviso do
+risco abaixo.** Ainda não reportada ao dono do projeto — ver "Regra de
+reporte" no fim deste arquivo; quem ler isto e não for o dono, trate como
+pendente.
 
 ```bash
-pip install code-review-graph      # requer Python 3.10+ (aqui: 3.11.15)
-code-review-graph install          # configura Claude Code / MCP
-code-review-graph build            # primeiro parse do repositório
+python3 -m ensurepip --user         # este ambiente não tinha pip
+python3 -m pip install --user code-review-graph   # v2.3.7, Python 3.14.6
+code-review-graph install --repo . --platform claude-code -y
+code-review-graph build
 ```
 
-Cobertura de linguagem confirmada para este projeto: `.js`, `.jsx` e `.mjs`
-mapeiam para o parser `javascript`. `db/schema.sql` **não** entra no grafo — o
-schema continua sendo lido à mão.
+Isso escreveu, sem passar por revisão humana antes de existir em disco:
+`.mcp.json` (servidor MCP `code_review_graph serve`, stdio), `CLAUDE.md` (novo,
+injeta "sempre use as tools do grafo antes de Grep/Glob/Read"), quatro skills
+novas em `.claude/skills/` (`explore-codebase`, `review-changes`,
+`debug-issue`, `refactor-safely`), um hook `PostToolUse`/`SessionStart` em
+`.claude/settings.json`, e um hook `pre-commit` em `.git/hooks/` que roda a
+cada commit. Nada disso foi commitado — está na árvore de trabalho.
+
+### Bug do parser JS — corrigido em 17/08/2026
+
+Causa raiz encontrada por leitura do pacote (`parser.py`,
+`_run_parser_load_probe`): o teste de cada gramática roda `python -I -c
+"...get_parser(...)"`. `-I` implica `-s`, que descarta o site-packages de
+**usuário** — e é lá que `pip install --user` tinha colocado
+`tree_sitter_language_pack`. O subprocess do probe nunca via o pacote, mesmo
+ele carregando normalmente fora do `-I`.
+
+**Correção aplicada:** um venv dedicado em
+`~/.local/share/code-review-graph-venv/` (não é site de usuário; `-I`/`-s` não
+o afeta). `.mcp.json`, os hooks em `.claude/settings.json` e
+`.git/hooks/pre-commit` foram apontados para os binários desse venv em vez do
+install `--user`. A instalação `--user` original ficou para trás, sem uso.
+
+```bash
+python3 -m venv ~/.local/share/code-review-graph-venv
+~/.local/share/code-review-graph-venv/bin/pip install code-review-graph
+# .mcp.json: "command" -> caminho absoluto do python3 do venv
+# hooks / pre-commit: export PATH="$HOME/.local/share/code-review-graph-venv/bin:$PATH" antes de chamar code-review-graph
+```
+
+**Resultado do rebuild, medido:** `Nodes: 382, Edges: 3982, Files: 63,
+Languages: sql, javascript` (363 nós JS, 19 SQL) — antes era `Nodes: 2,
+Languages: sql`. Testado com uma consulta real deste projeto:
+`code-review-graph impact --files server/crud.js` devolveu **51 arquivos
+afetados**, consistente com o que este próprio documento descreve como "os
+quatro pontos de onde tudo pende". O servidor MCP (`python3 -m
+code_review_graph serve`, agora com o python do venv) sobe sem erro de
+import.
+
+**A skill está funcional.** Falta reiniciar o Claude Code para o `.mcp.json`
+novo ser lido e as tools `*_tool` (`get_impact_radius_tool`,
+`query_graph_tool` etc.) ficarem disponíveis nesta sessão — até lá, os
+comandos CLI (`code-review-graph impact/query/search/...` pelo venv) já
+funcionam via Bash.
 
 Antes de instalar, vale lembrar o que a auditoria em `CONTEXT.md` apurou: é um
 pacote de terceiros do PyPI que roda como servidor MCP com acesso de leitura ao
